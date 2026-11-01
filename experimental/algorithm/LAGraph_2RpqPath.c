@@ -14,10 +14,10 @@
 // There is no visited mask: alternative predecessors and cycles must survive
 // in P.  Path semantics are checked later, during backward reconstruction.
 //
-// Increments 1 through 6 build the predecessor relation to a fixed point.
+// Increments 1 through 7 build P and reconstruct all bounded-length paths.
 // All owned matrices are local variables in LG_RpqPath_Traverse.
-// Path reconstruction follows in later increments.
-// The internal workspace is not yet a public path-result interface.
+// Simple, trail and shortest-path restrictions follow in later increments.
+// The public AllPaths wrapper owns the internal workspace for one query.
 // Optimizations, including minor ones, require the user's prior approval.
 
 // The input helpers own no memory; workspace cleanup is enabled before Init.
@@ -39,6 +39,24 @@
 // traversal, which terminates when P stops receiving new predecessor records.
 #ifndef LG_RPQ_PATH_MAX_LENGTH
 #define LG_RPQ_PATH_MAX_LENGTH 1024
+#endif
+#if LG_RPQ_PATH_MAX_LENGTH < 0
+#error "LG_RPQ_PATH_MAX_LENGTH must be nonnegative"
+#endif
+
+// Working reconstruction-buffer capacity, measured in vertex/label integers.
+// Grow geometrically when the next predecessor does not fit the current buffer.
+#ifndef LG_RPQ_PATH_INITIAL_CAPACITY
+#define LG_RPQ_PATH_INITIAL_CAPACITY 2
+#endif
+#ifndef LG_RPQ_PATH_GROWTH_FACTOR
+#define LG_RPQ_PATH_GROWTH_FACTOR 2
+#endif
+#if LG_RPQ_PATH_INITIAL_CAPACITY < 1
+#error "LG_RPQ_PATH_INITIAL_CAPACITY must be positive"
+#endif
+#if LG_RPQ_PATH_GROWTH_FACTOR < 2
+#error "LG_RPQ_PATH_GROWTH_FACTOR must be at least 2"
 #endif
 
 // Number of predecessor records in one temporary block.  This is a baseline
@@ -823,6 +841,283 @@ static void LG_RpqPath_MergePredecessors
     *(LG_RpqPath_StoredSet *) z = result ;
 }
 
+// One graph path, independent of the accepting run of the NFA.  length counts
+// edges; elements owns exactly 2 * length + 1 integers in traversal order:
+// vertex, label, vertex, ..., label, vertex.  A zero-edge path owns one vertex.
+// The result has no pointers into P, roots, the temporary pool or DFS storage.
+typedef LAGraph_RpqPath LG_RpqPath_Path ;
+
+/**
+ * @brief Release a returned path array and all its independently owned paths.
+ *
+ * @param[in,out] paths Address of an owned array of path_count entries.  Each
+ *     element buffer and the array itself are freed, and *paths becomes NULL.
+ *     A NULL address or an already NULL array is accepted.
+ * @param[in] path_count Number of initialized entries in *paths.  Ignored if
+ *     paths or *paths is NULL; the caller's count variable is not modified.
+ */
+static void LG_RpqPath_FreePaths
+(
+    LG_RpqPath_Path **paths,
+    size_t path_count
+)
+{
+    if (paths == NULL || *paths == NULL) return ;
+    for (size_t k = 0 ; k < path_count ; k++)
+    {
+        LAGraph_Free ((void **) &(*paths)[k].elements, NULL) ;
+    }
+    LAGraph_Free ((void **) paths, NULL) ;
+}
+
+// Only reconstruction owns these buffers.  The recursive calls share the
+// working prefix, while completed results own separate forward-order copies.
+// No matrix handles, cached cells or memoized suffixes are stored here.
+typedef struct
+{
+    LG_RpqPath_Path *paths ;
+    size_t count ;
+    uint64_t *reverse_path ;         // target, label, predecessor, ..., source
+    size_t capacity ;                // allocated integer slots in reverse_path
+}
+LG_RpqPath_Reconstruction ;
+
+/**
+ * @brief Reserve a working prefix for a backward path of the requested length.
+ *
+ * @param[in,out] reconstruction Non-NULL reconstruction state.  Its working
+ *     buffer may move; callers must access it through this state after a call.
+ *     Existing prefix elements remain intact.  Results are not modified.
+ * @param[in] length Required path length in edges; the endpoint adds one slot.
+ *     Storage is reserved for 2 * length + 1 integer slots.  Zero is allowed.
+ * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes.
+ * @return GrB_SUCCESS or an allocation error.  The old buffer is retained on
+ *     failure.  Capacity starts at LG_RPQ_PATH_INITIAL_CAPACITY integer slots
+ *     and grows by LG_RPQ_PATH_GROWTH_FACTOR until the prefix fits.
+ */
+static int LG_RpqPath_ReservePath
+(
+    LG_RpqPath_Reconstruction *reconstruction,
+    size_t length,
+    char *msg
+)
+{
+    if (length > (SIZE_MAX - 1) / 2)
+    {
+        LG_ERROR_MSG ("reconstructed path length exceeds addressable memory") ;
+        return (GrB_OUT_OF_MEMORY) ;
+    }
+    size_t needed = 2 * length + 1 ;
+    if (needed <= reconstruction->capacity) return (GrB_SUCCESS) ;
+    size_t capacity = reconstruction->capacity == 0 ?
+        LG_RPQ_PATH_INITIAL_CAPACITY : reconstruction->capacity ;
+    while (capacity < needed)
+    {
+        // Near the addressable limit, use the exact request instead of
+        // overflowing the geometric capacity or its allocation byte count.
+        if (capacity > SIZE_MAX / sizeof (uint64_t) /
+            LG_RPQ_PATH_GROWTH_FACTOR)
+        {
+            capacity = needed ;
+            break ;
+        }
+        capacity *= LG_RPQ_PATH_GROWTH_FACTOR ;
+    }
+    int info = LAGraph_Realloc ((void **) &reconstruction->reverse_path,
+        capacity, reconstruction->capacity, sizeof (uint64_t), msg) ;
+    if (info == GrB_SUCCESS) reconstruction->capacity = capacity ;
+    return (info) ;
+}
+
+/**
+ * @brief Save the current backward prefix as a distinct forward graph path.
+ *
+ * @param[in,out] reconstruction Non-NULL state with a valid reverse_path
+ *     prefix of 2 * length + 1 slots.  A new result is appended only if no
+ *     existing result has the same vertex/label sequence.  The working prefix
+ *     is read-only; each saved result receives its own allocation.
+ * @param[in] length Number of edges in the valid working prefix; may be zero.
+ * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes.
+ * @return GrB_SUCCESS or an allocation error.  Previously saved paths remain
+ *     owned by reconstruction even if allocating the new result fails.
+ *
+ * Different NFA runs, initial states or accepting states may describe the
+ * same graph path.  A direct scan removes these duplicates without a cache or
+ * hash table.  Equal endpoints with different labels remain different paths.
+ */
+static int LG_RpqPath_SavePath
+(
+    LG_RpqPath_Reconstruction *reconstruction,
+    size_t length,
+    char *msg
+)
+{
+    size_t slots = 2 * length + 1 ;
+    for (size_t k = 0 ; k < reconstruction->count ; k++)
+    {
+        const LG_RpqPath_Path *path = &reconstruction->paths[k] ;
+        if (path->length != length) continue ;
+        size_t i = 0 ;
+        while (i < slots && path->elements[i] ==
+            reconstruction->reverse_path[slots - 1 - i])
+        {
+            i++ ;
+        }
+        if (i == slots) return (GrB_SUCCESS) ;
+    }
+
+    if (reconstruction->count == SIZE_MAX)
+    {
+        LG_ERROR_MSG ("reconstructed path count exceeds addressable memory") ;
+        return (GrB_OUT_OF_MEMORY) ;
+    }
+    uint64_t *elements = NULL ;
+    int info = LAGraph_Malloc ((void **) &elements, slots,
+        sizeof (uint64_t), msg) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    for (size_t i = 0 ; i < slots ; i++)
+    {
+        elements[i] = reconstruction->reverse_path[slots - 1 - i] ;
+    }
+    info = LAGraph_Realloc ((void **) &reconstruction->paths,
+        reconstruction->count + 1, reconstruction->count,
+        sizeof (LG_RpqPath_Path), msg) ;
+    if (info != GrB_SUCCESS)
+    {
+        LAGraph_Free ((void **) &elements, NULL) ;
+        return (info) ;
+    }
+    reconstruction->paths[reconstruction->count++] =
+        (LG_RpqPath_Path) { .length = length, .elements = elements } ;
+    return (GrB_SUCCESS) ;
+}
+
+/**
+ * @brief Recursively follow every predecessor of one product-graph cell.
+ *
+ * @param[in] P Completed StoredSet matrix, borrowed and never modified.
+ *     Its record buffers must remain alive throughout reconstruction.
+ * @param[in] roots Immutable Boolean relation QS x S, borrowed for this call.
+ * @param[in] state NFA state of the current cell, in [0, nrows(P)).
+ * @param[in] vertex Graph vertex of the current cell, in [0, ncols(P)).
+ * @param[in] length Number of edges already in the backward prefix.  The last
+ *     vertex of that prefix is vertex; initially length is zero.
+ * @param[in,out] reconstruction Non-NULL state owning the working prefix and
+ *     completed results.  Only the prefix through length is valid on entry.
+ *     Deeper slots may be overwritten by sibling branches; length is passed
+ *     by value, so returning automatically restores the caller's prefix length.
+ * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes.
+ * @return GrB_SUCCESS or a GraphBLAS/allocation error.  On error the owner
+ *     still tracks all saved paths and the working buffer for caller cleanup.
+ *
+ * A root emits a path but does not stop descent: longer valid paths can return
+ * to roots through cycles or come from another source.  Emission happens
+ * before the depth check, including for zero edges and exactly MAX_LENGTH.
+ * No visited set is used.  Cycles are bounded only by the edge-count limit.
+ */
+static int LG_RpqPath_ReconstructCell
+(
+    GrB_Matrix P,
+    GrB_Matrix roots,
+    GrB_Index state,
+    GrB_Index vertex,
+    size_t length,
+    LG_RpqPath_Reconstruction *reconstruction,
+    char *msg
+)
+{
+    bool root = false ;
+    int info = GrB_Matrix_extractElement_BOOL (&root, roots, state, vertex) ;
+    if (info != GrB_SUCCESS && info != GrB_NO_VALUE) return (info) ;
+    if (info == GrB_SUCCESS && root)
+    {
+        info = LG_RpqPath_SavePath (reconstruction, length, msg) ;
+        if (info != GrB_SUCCESS) return (info) ;
+    }
+    if (length >= LG_RPQ_PATH_MAX_LENGTH) return (GrB_SUCCESS) ;
+
+    LG_RpqPath_StoredSet predecessors = { .count = 0, .allocation = NULL } ;
+    info = GrB_Matrix_extractElement_UDT (&predecessors, P, state, vertex) ;
+    if (info == GrB_NO_VALUE) return (GrB_SUCCESS) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    for (size_t k = 0 ; k < predecessors.count ; k++)
+    {
+        const LG_RpqPath_Predecessor *predecessor =
+            &predecessors.allocation->records[k] ;
+        info = LG_RpqPath_ReservePath (reconstruction, length + 1, msg) ;
+        if (info != GrB_SUCCESS) return (info) ;
+        reconstruction->reverse_path[2 * length + 1] = predecessor->label ;
+        reconstruction->reverse_path[2 * length + 2] = predecessor->vertex ;
+        info = LG_RpqPath_ReconstructCell (P, roots,
+            predecessor->state, predecessor->vertex, length + 1,
+            reconstruction, msg) ;
+        if (info != GrB_SUCCESS) return (info) ;
+    }
+    return (GrB_SUCCESS) ;
+}
+
+/**
+ * @brief Enumerate distinct graph paths ending in any supplied accepting state.
+ *
+ * @param[out] paths Non-NULL address receiving an owned array.  On success,
+ *     free it with LG_RpqPath_FreePaths.  On failure or an empty result it is
+ *     NULL.  Must not hold an unreleased array on entry.
+ * @param[out] path_count Non-NULL address receiving the number of paths;
+ *     set to zero on failure or an empty result.
+ * @param[in] P Completed StoredSet matrix, borrowed until this call returns.
+ * @param[in] roots Immutable QS x S relation, with the same dimensions as P.
+ * @param[in] QF Array of nqf validated accepting states; NULL allowed if nqf=0.
+ *     Used as supplied for direct and inverse queries, without swapping QS/QF.
+ * @param[in] nqf Number of accepting-state entries; duplicates are allowed.
+ * @param[in] ng Number of graph vertices, equal to ncols(P).  Every vertex is
+ *     considered as a possible endpoint; there is no separate target filter.
+ * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes.
+ * @return GrB_SUCCESS or a GraphBLAS/allocation error.  No partial result is
+ *     returned on failure.  P, roots and their contents are never modified.
+ *
+ * Output sequences run from a source in S to an accepting endpoint in the
+ * query's traversal direction.  Labels keep their decomposition indices even
+ * when an edge is traversed backwards.  All paths through MAX_LENGTH edges
+ * are returned; zero means that only zero-edge paths can be emitted.
+ */
+static int LG_RpqPath_Reconstruct
+(
+    LG_RpqPath_Path **paths,
+    size_t *path_count,
+    GrB_Matrix P,
+    GrB_Matrix roots,
+    const GrB_Index *QF,
+    size_t nqf,
+    GrB_Index ng,
+    char *msg
+)
+{
+    *paths = NULL ;
+    *path_count = 0 ;
+    LG_RpqPath_Reconstruction reconstruction = { 0 } ;
+    int info = GrB_SUCCESS ;
+    for (size_t k = 0 ; k < nqf ; k++)
+    {
+        for (GrB_Index vertex = 0 ; vertex < ng ; vertex++)
+        {
+            info = LG_RpqPath_ReservePath (&reconstruction, 0, msg) ;
+            if (info != GrB_SUCCESS) goto reconstruction_cleanup ;
+            reconstruction.reverse_path[0] = vertex ;
+            info = LG_RpqPath_ReconstructCell (P, roots, QF[k], vertex, 0,
+                &reconstruction, msg) ;
+            if (info != GrB_SUCCESS) goto reconstruction_cleanup ;
+        }
+    }
+    *paths = reconstruction.paths ;
+    *path_count = reconstruction.count ;
+    reconstruction.paths = NULL ;
+
+reconstruction_cleanup:
+    LG_RpqPath_FreePaths (&reconstruction.paths, reconstruction.count) ;
+    LAGraph_Free ((void **) &reconstruction.reverse_path, NULL) ;
+    return (info) ;
+}
+
 typedef struct
 {
     GrB_Index ng ;                   // number of graph vertices
@@ -1052,7 +1347,7 @@ static int LG_RpqPath_PrepareDecomposition
  * @param[in] QS Array of nqs initial NFA state indices; NULL allowed if nqs=0.
  * @param[in] nqs Number of entries in QS; duplicates are allowed.
  * @param[in] QF Array of nqf accepting NFA state indices; NULL allowed if nqf=0.
- *     This increment only validates these indices; QF is not retained.
+ *     These indices are validated but not retained; pass them to Traverse.
  * @param[in] nqf Number of entries in QF; duplicates are allowed.
  * @param[in] G Graph decomposition: nl graph handles indexed by label.
  *     Individual entries may be NULL; at least one adjacency matrix must exist.
@@ -1067,8 +1362,8 @@ static int LG_RpqPath_PrepareDecomposition
  * All indices are zero-based.  Empty source/start/final sets are valid.
  * Input matrices are borrowed and must remain alive while the workspace is
  * used.  Matrix handles and direction flags are copied into workspace arrays.
- * QS, QF and S are validated but not retained.  Supply QS and S to Traverse
- * again when creating the local initial frontier.
+ * QS, QF and S are validated but not retained.  Supply them to Traverse again
+ * when creating the initial frontier and reconstructing accepting paths.
  *
  * @return GrB_SUCCESS on success, otherwise a LAGraph/GraphBLAS error code;
  *     any partially allocated workspace is released before returning an error.
@@ -1101,7 +1396,7 @@ int LG_RpqPath_Init
     LG_TRY (LG_RpqPath_ValidateInput (workspace, R, inverse_labels, nl,
         QS, nqs, QF, nqf, G, S, ns, msg)) ;
 #else
-    // These sets are only validated here; Traverse receives QS and S directly.
+    // These sets are only validated here; Traverse receives them directly.
     (void) QS ;
     (void) nqs ;
     (void) QF ;
@@ -1155,37 +1450,55 @@ int LG_RpqPath_Init
 }
 
 /**
- * @brief Set up local traversal matrices and the per-iteration lifecycle.
+ * @brief Build P to a fixed point and reconstruct all bounded-length paths.
  *
+ * @param[out] paths Non-NULL address receiving an owned array of distinct
+ *     vertex/label paths.  Release it with LG_RpqPath_FreePaths.  Set to NULL
+ *     on failure or an empty result; must not hold an unreleased array on entry.
+ * @param[out] path_count Non-NULL address receiving the number of paths;
+ *     set to zero on failure or an empty result.
  * @param[in] work Initialized metadata and value types from LG_RpqPath_Init.
  *     Borrowed for this call; the caller retains ownership of the context.
  * @param[in] QS Array of nqs initial NFA states, already validated by Init.
  *     NULL is allowed when nqs is zero; duplicates collapse in roots.
  * @param[in] nqs Number of entries in QS.
+ * @param[in] QF Array of nqf accepting NFA states, already validated by Init.
+ *     NULL is allowed when nqf is zero.  Used as supplied for inverse queries.
+ * @param[in] nqf Number of entries in QF; duplicates do not duplicate results.
  * @param[in] S Array of ns source vertices, already validated by Init.
  *     NULL is allowed when ns is zero; duplicates collapse in roots.
  * @param[in] ns Number of entries in S.
  * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes;
  *     may be NULL.  Cleared on entry.
  *
- * @return GrB_SUCCESS when P reaches a fixed point, GrB_OUT_OF_MEMORY on
- *     allocation failure or pool exhaustion, or a GraphBLAS error code.
+ * @return GrB_SUCCESS when P reaches a fixed point and reconstruction finishes,
+ *     GrB_OUT_OF_MEMORY on allocation failure or pool exhaustion, or a
+ *     GraphBLAS error code.  No partial path result is returned on error.
  * @note Builds P using both products and deep-copy accumulation.  The next
  *     frontier marks exactly the cells receiving new predecessor records.
- *     Reconstruction is still missing; no paths are returned yet.  All owned
- *     matrices, operators, stored buffers and arena memory are released here.
+ *     Paths through LG_RPQ_PATH_MAX_LENGTH edges are reconstructed, including
+ *     zero-edge paths.  Returned sequences follow the query traversal direction
+ *     and retain original label indices.  Repeated vertices and edges are
+ *     allowed.  All matrices, operators, stored buffers and arena memory are
+ *     released here; only independent path buffers pass to the caller.
  */
 int LG_RpqPath_Traverse
 (
+    LG_RpqPath_Path **paths,
+    size_t *path_count,
     LG_RpqPath_Workspace *work,
     const GrB_Index *QS,
     size_t nqs,
+    const GrB_Index *QF,
+    size_t nqf,
     const GrB_Index *S,
     size_t ns,
     char *msg
 )
 {
     LG_CLEAR_MSG ;
+    *paths = NULL ;
+    *path_count = 0 ;
     int info = GrB_SUCCESS ;
     bool pool_exhausted = false ;   // preserve exhaustion across arena reset
 
@@ -1218,6 +1531,7 @@ int LG_RpqPath_Traverse
     GrB_Monoid predecessor_union_monoid = NULL ;
     GxB_IndexBinaryOp collect_predecessors = NULL ;
     GrB_Type predecessor_context_type = NULL ;
+    GrB_Descriptor predecessor_product = NULL ;
 
     // Read-only comparison of C with the old P produces Boolean change flags.
     GrB_BinaryOp has_new_predecessors = NULL ;
@@ -1291,6 +1605,18 @@ int LG_RpqPath_Traverse
         LG_RpqPath_CollectPredecessors, work->temporary_set_type,
         work->state_set_type, GrB_BOOL, predecessor_context_type,
         "LG_RpqPath_CollectPredecessors", NULL) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+
+    // Correctness workaround for SuiteSparse's generic flipped indexed SAXPY
+    // kernel: it sizes operand buffers using GB_GENERIC_FLIPXY, overlooking
+    // GB_GENERIC_IDX_FLIPXY.  StateSet x bool can therefore copy a full StateSet
+    // into a bool-sized buffer when the backend swaps operands for CSR/CSC.
+    // The generic dot kernel handles mixed operand sizes correctly.  This is
+    // an explicit backend restriction, not a performance tuning decision.
+    info = GrB_Descriptor_new (&predecessor_product) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    info = GrB_Descriptor_set (predecessor_product,
+        GxB_AxB_METHOD, GxB_AxB_DOT) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
 
     info = GrB_BinaryOp_new (&has_new_predecessors,
@@ -1393,10 +1719,11 @@ int LG_RpqPath_Traverse
             // Accumulate all labels into C without replacing previous values.
             // The indexed product records j from H[p,j], which is unchanged
             // when the graph operand is transposed for an inverse label.
-            GrB_Descriptor graph_direction = work->reverse_graph[a] ?
-                GrB_DESC_T1 : NULL ;
+            info = GrB_Descriptor_set (predecessor_product, GrB_INP1,
+                work->reverse_graph[a] ? GrB_TRAN : GrB_DEFAULT) ;
+            if (info != GrB_SUCCESS) goto iteration_cleanup ;
             info = GrB_mxm (C, NULL, predecessor_union, predecessor_semiring,
-                H, work->A[a], graph_direction) ;
+                H, work->A[a], predecessor_product) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
             info = GrB_Matrix_wait (C, GrB_MATERIALIZE) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
@@ -1507,7 +1834,10 @@ iteration_cleanup:
         if (info != GrB_SUCCESS) goto traversal_cleanup ;
     }
 
-    // TODO: Reconstruct paths from local P and roots before releasing them.
+    // The last update of P is materialized.  Retain its independent buffers
+    // until all recursive reads finish; saved paths own copies of their data.
+    info = LG_RpqPath_Reconstruct (paths, path_count, P, roots,
+        QF, nqf, work->ng, msg) ;
 traversal_cleanup:
     GrB_free (&frontier) ;
     GrB_free (&roots) ;
@@ -1521,6 +1851,7 @@ traversal_cleanup:
     GrB_free (&stored_context_type) ;
     GrB_free (&empty_temporary) ;
     GrB_free (&empty_stored) ;
+    GrB_free (&predecessor_product) ;
     GrB_free (&collect_predecessors) ;
     GrB_free (&predecessor_union_monoid) ;
     GrB_free (&predecessor_union) ;
@@ -1539,7 +1870,61 @@ traversal_cleanup:
     }
     else if (info != GrB_SUCCESS && (msg == NULL || msg[0] == '\0'))
     {
-        LG_ERROR_MSG ("GraphBLAS failure during RPQ traversal: info: %d", info) ;
+        LG_ERROR_MSG ("RPQ traversal or reconstruction failed: info: %d", info) ;
     }
     return (info) ;
+}
+
+// The public contract and argument documentation are in LAGraphX.h.  Keep
+// initialization, traversal and workspace lifetime behind this one entry point
+// so callers need only supply graph/NFA decompositions and consume paths.
+int LAGraph_2RpqPath_AllPaths
+(
+    LAGraph_RpqPath **paths,
+    size_t *path_count,
+    LAGraph_Graph *R,
+    const bool *inverse_labels,
+    size_t nl,
+    const GrB_Index *QS,
+    size_t nqs,
+    const GrB_Index *QF,
+    size_t nqf,
+    LAGraph_Graph *G,
+    const GrB_Index *S,
+    size_t ns,
+    bool inverse,
+    char *msg
+)
+{
+    LG_CLEAR_MSG ;
+    if (paths != NULL) *paths = NULL ;
+    if (path_count != NULL) *path_count = 0 ;
+    if (paths == NULL || path_count == NULL)
+    {
+        LG_ERROR_MSG ("path result addresses must not be NULL") ;
+        return (GrB_NULL_POINTER) ;
+    }
+    LG_RpqPath_Workspace *work = NULL ;
+    int info = LG_RpqPath_Init (&work, R, inverse_labels, nl,
+        QS, nqs, QF, nqf, G, S, ns, inverse, msg) ;
+    if (info == GrB_SUCCESS)
+    {
+        info = LG_RpqPath_Traverse (paths, path_count, work,
+            QS, nqs, QF, nqf, S, ns, msg) ;
+    }
+    LG_RpqPath_Free (&work) ;
+    return (info) ;
+}
+
+// See LAGraphX.h for ownership and argument documentation.
+int LAGraph_2RpqPath_FreePaths
+(
+    LAGraph_RpqPath **paths,
+    size_t path_count,
+    char *msg
+)
+{
+    LG_CLEAR_MSG ;
+    LG_RpqPath_FreePaths (paths, path_count) ;
+    return (GrB_SUCCESS) ;
 }

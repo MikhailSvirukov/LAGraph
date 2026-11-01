@@ -123,3 +123,7 @@ foreach( testsourcefile ${TEST_SOURCES} )
     endif ( )
 endforeach( testsourcefile ${TEST_SOURCES} )
 
+# The cyclic RPQ cases must terminate when P reaches a fixed point, even
+# though reconstruction can enumerate repeated vertices and edges.
+set_tests_properties ( LAGraphX_2RpqPath PROPERTIES TIMEOUT 60 )
+
