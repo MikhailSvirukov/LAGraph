@@ -29,6 +29,15 @@ typedef struct
 }
 ExpectedPath ;
 
+// All four public query functions share their argument and ownership contract.
+typedef int (*TestQueryFunction)
+(
+    LAGraph_RpqPath **paths, size_t *path_count,
+    LAGraph_Graph *R, const bool *inverse_labels, size_t nl,
+    const GrB_Index *QS, size_t nqs, const GrB_Index *QF, size_t nqf,
+    LAGraph_Graph *G, const GrB_Index *S, size_t ns, bool inverse, char *msg
+) ;
+
 typedef struct
 {
     GrB_Index graph_vertices, automaton_states ;
@@ -40,6 +49,7 @@ typedef struct
     bool inverse ;
     const ExpectedPath *expected ;
     size_t expected_count ;
+    TestQueryFunction run ;          // NULL selects AllPaths for existing cases
 }
 TestQuery ;
 
@@ -111,10 +121,12 @@ static void test_run_query
     test_build_decomposition (R, query->automaton_states,
         query->automaton_edges, query->automaton_edge_count) ;
 
-    int info = LAGraph_2RpqPath_AllPaths (paths, count, R,
+    TestQueryFunction run = query->run == NULL ?
+        LAGraph_2RpqPath_AllPaths : query->run ;
+    int info = run (paths, count, R,
         query->inverse_labels, TEST_LABELS, query->QS, query->nqs,
         query->QF, query->nqf, G, query->S, query->ns, query->inverse, msg) ;
-    TEST_ASSERT_ (info == GrB_SUCCESS, "AllPaths info=%d: %s", info, msg) ;
+    TEST_ASSERT_ (info == GrB_SUCCESS, "RPQ query info=%d: %s", info, msg) ;
     for (size_t a = 0 ; a < TEST_LABELS ; a++)
     {
         TEST_CHECK (LAGraph_Delete (&G[a], msg) == GrB_SUCCESS) ;
@@ -931,6 +943,1010 @@ static void test_length_limit (void)
     TEST_CHECK (LAGraph_Finalize (msg) == GrB_SUCCESS) ;
 }
 
+
+/*
+ * Graph: [0] -a-> 1 -b-> 2 -c-> 3
+ *          ^      |
+ *          +--b---+
+ *          +-----------c-------> 3
+ * NFA:  -->q0 -a-> q1 -b-> q2 -c-> ((q3))
+ *
+ * Simple: keep 0-a-1-b-2-c-3; reject 0-a-1-b-0-c-3, which repeats vertex 0.
+ */
+static void test_simple_repeated_vertex (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 1, 1, 0 },
+        { 1, 1, 2 },
+        { 0, 2, 3 },
+        { 2, 2, 3 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 1, 1, 2 },
+        { 2, 2, 3 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 3, { 0, 0, 1, 1, 2, 2, 3 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 4, .automaton_states = 4,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 3 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllSimple
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> [0]       [0] -b-> 1
+ * NFA:  -->q0 -a-> q0        q0 -b-> ((q1))
+ *
+ * Simple: the a self-loop repeats vertex 0.  Only the direct b path remains.
+ */
+static void test_simple_self_loop (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 0 },
+        { 0, 1, 1 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 0 },
+        { 0, 1, 1 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 1, { 0, 1, 1 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 2, .automaton_states = 2,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 1 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllSimple
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1 -b-> [0]
+ * NFA:  -->q0 -a-> q1 -b-> ((q2))
+ *
+ * Simple: the NFA accepts ab, but its only graph path repeats its source.
+ */
+static void test_simple_closed_path (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 1, 1, 0 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 1, 1, 2 }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 2, .automaton_states = 3,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 2 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = NULL,
+        .expected_count = 0,
+        .run = LAGraph_2RpqPath_AllSimple
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1        [0] -b-> 1
+ * NFA:  -->q0 -a-> ((q1))   q0 -b-> ((q1))
+ *
+ * Simple: both labeled one-edge paths are distinct and have no vertex repeats.
+ */
+static void test_simple_parallel_labels (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 0, 1, 1 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 0, 1, 1 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 1, { 0, 0, 1 } },
+        { 1, { 0, 1, 1 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 2, .automaton_states = 2,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 1 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllSimple
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> [1] -a-> 2
+ * NFA:  -->((q0)) -a-> q0
+ *
+ * Simple, S={0,1}: retain both zero-edge paths and all three nonempty paths.
+ * A root in the middle of a path does not block another source's path.
+ */
+static void test_simple_sources_and_roots (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 1, 0, 2 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 0 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 0, { 0 } },
+        { 0, { 1 } },
+        { 1, { 0, 0, 1 } },
+        { 1, { 1, 0, 2 } },
+        { 2, { 0, 0, 1, 0, 2 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 3, .automaton_states = 1,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 0 }, .nqf = 1,
+        .S = { 0, 1 }, .ns = 2,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllSimple
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0]               (no edges)
+ * NFA:  -->((q0))          (no transitions)
+ *
+ * Simple: the zero-edge path is valid.
+ */
+static void test_simple_zero_length (void)
+{
+    const ExpectedPath expected [] =
+    {
+        { 0, { 0 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 1, .automaton_states = 1,
+        .graph_edges = NULL, .graph_edge_count = 0,
+        .automaton_edges = NULL,
+        .automaton_edge_count = 0,
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 0 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllSimple
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1 -a-> 2 -a-> [0]
+ * NFA:  -->((q0)) -a-> q0
+ *
+ * Trails: the three-edge closed path is valid; a fourth edge would repeat 0-a->1.
+ * Expected: the empty path and the three successive prefixes of one circuit.
+ */
+static void test_trails_vertex_revisit (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 1, 0, 2 },
+        { 2, 0, 0 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 0 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 0, { 0 } },
+        { 1, { 0, 0, 1 } },
+        { 2, { 0, 0, 1, 0, 2 } },
+        { 3, { 0, 0, 1, 0, 2, 0, 0 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 3, .automaton_states = 1,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 0 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllTrails
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1 -a-> [0] -b-> 1
+ * NFA:  -->q0 -a-> q1 -a-> q2 -b-> ((q3))
+ *
+ * Trails: the ordered pair (0,1) occurs twice, under different labels a and b.
+ * The edges are distinct, so 0-a-1-a-0-b-1 is valid.
+ */
+static void test_trails_different_labels (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 1, 0, 0 },
+        { 0, 1, 1 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 1, 0, 2 },
+        { 2, 1, 3 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 3, { 0, 0, 1, 0, 0, 1, 1 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 2, .automaton_states = 4,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 3 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllTrails
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1 -a-> [0]
+ * NFA:  -->q0 -a-> q1 -a-> ((q2))
+ *
+ * Trails: 0-a->1 and 1-a->0 are different directed edges despite equal labels.
+ */
+static void test_trails_opposite_directions (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 1, 0, 0 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 1, 0, 2 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 2, { 0, 0, 1, 0, 0 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 2, .automaton_states = 3,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 2 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllTrails
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1 -b-> [0]
+ * NFA:  -->q0 -a-> q1 -b-> q2 -a-> ((q3))
+ *
+ * Trails: the sole accepted walk 0-a-1-b-0-a-1 repeats the edge 0-a->1.
+ * Different NFA states on its two uses do not make it a different graph edge.
+ */
+static void test_trails_repeated_edge (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 1, 1, 0 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 1, 1, 2 },
+        { 2, 0, 3 }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 2, .automaton_states = 4,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 3 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = NULL,
+        .expected_count = 0,
+        .run = LAGraph_2RpqPath_AllTrails
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> [0]
+ * NFA:  -->q0 -a-> ((q1)) -a-> ((q2))
+ *
+ * Trails: the self-loop can be used once.  The accepted two-edge walk repeats it.
+ */
+static void test_trails_self_loop_once (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 0 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 1, 0, 2 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 1, { 0, 0, 0 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 1, .automaton_states = 3,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 1, 2 }, .nqf = 2,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllTrails
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1 -b-> [0] -a-> 2 -c-> 3
+ *                   +--------------c----> 3
+ * NFA:  -->q0 -a-> q1 -b-> q2 -a-> q3 -c-> ((q4))
+ *
+ * Trails: keep 0-a-1-b-0-a-2-c-3, whose a edges have different destinations.
+ * Reject 0-a-1-b-0-a-1-c-3, which repeats the full edge (0,a,1).
+ */
+static void test_trails_different_targets (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 1, 1, 0 },
+        { 0, 0, 2 },
+        { 1, 2, 3 },
+        { 2, 2, 3 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 1, 1, 2 },
+        { 2, 0, 3 },
+        { 3, 2, 4 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 4, { 0, 0, 1, 1, 0, 0, 2, 2, 3 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 4, .automaton_states = 5,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 4 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllTrails
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1        [0] -b-> 1
+ * NFA:  -->q0 -a-> q1 -b-> ((q2))
+ *
+ * Trails, inverse_labels[b]=true: 0-a-1-b-0 is a valid closed trail.
+ * The reverse traversal of b is distinct from the forward traversal of a.
+ */
+static void test_trails_inverse_label (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 0, 1, 1 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 1, 1, 2 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 2, { 0, 0, 1, 1, 0 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 2, .automaton_states = 3,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 2 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .inverse_labels = { false, true, false },
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllTrails
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1 -a-> 3
+ *          +--a-> 2 -a---^
+ * NFA:  -->q0 -a-> q1 -a-> ((q2))
+ *
+ * Shortest: both two-edge branches to vertex 3 are tied and must be returned.
+ */
+static void test_shortest_equal_branches (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 0, 0, 2 },
+        { 1, 0, 3 },
+        { 2, 0, 3 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 1, 0, 2 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 2, { 0, 0, 1, 0, 3 } },
+        { 2, { 0, 0, 2, 0, 3 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 4, .automaton_states = 3,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 2 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllShortestPaths
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1 -b-> 2
+ * NFA:  -->q0 -a-> ((q1)) -b-> ((q2))
+ *
+ * Shortest: vertex 1 has minimum length 1, vertex 2 has minimum length 2.
+ * The minimum is per destination, not a global minimum across results.
+ */
+static void test_shortest_per_destination (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 1, 1, 2 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 1, 1, 2 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 1, { 0, 0, 1 } },
+        { 2, { 0, 0, 1, 1, 2 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 3, .automaton_states = 3,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 1, 2 }, .nqf = 2,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllShortestPaths
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1 -b-> 2 -c-> 3
+ *          +---------------a----^
+ * NFA:  -->q0 -a-> ((q1)) -b-> q2 -c-> ((q3))
+ *
+ * Shortest, QF={q3,q1}: abc reaches vertex 3 through the first accepting state,
+ * then a supplies a shorter accepted path through q1.  Replace abc with a.
+ * The already saved shortest path to vertex 1 must remain intact.
+ */
+static void test_shortest_later_final_state (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 3 },
+        { 0, 0, 1 },
+        { 1, 1, 2 },
+        { 2, 2, 3 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 1, 1, 2 },
+        { 2, 2, 3 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 1, { 0, 0, 1 } },
+        { 1, { 0, 0, 3 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 4, .automaton_states = 4,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 3, 1 }, .nqf = 2,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllShortestPaths
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1 -a-> 4
+ *        [2] --------a--> 4
+ *        [3] --------a--> 4
+ * NFA:  -->q0 -a-> ((q1)) -a-> q1
+ *
+ * Shortest, S={0,2,3}: vertex 4 has two one-edge ties from sources 2 and 3.
+ * Discard the two-edge route from source 0; keep its one-edge route to vertex 1.
+ */
+static void test_shortest_sources (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 1, 0, 4 },
+        { 2, 0, 4 },
+        { 3, 0, 4 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 1, 0, 1 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 1, { 0, 0, 1 } },
+        { 1, { 2, 0, 4 } },
+        { 1, { 3, 0, 4 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 5, .automaton_states = 2,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 1 }, .nqf = 1,
+        .S = { 0, 2, 3 }, .ns = 3,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllShortestPaths
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1         [0] -b-> 1
+ * NFA:  -->q0 -a-> ((q1))    q0 -b-> ((q2))
+ *
+ * Shortest: different accepting states supply equal-length paths to vertex 1.
+ * Both label sequences must survive the shared minimum.
+ */
+static void test_shortest_parallel_final_states (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 0, 1, 1 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 0, 1, 2 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 1, { 0, 0, 1 } },
+        { 1, { 0, 1, 1 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 2, .automaton_states = 3,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 1, 2 }, .nqf = 2,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllShortestPaths
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1 -b-> 2
+ * NFA:  -->q0 -a-> q1 -b-> ((q3))
+ *           q0 -a-> q2 -b-> q3
+ *
+ * Shortest: two tied accepting NFA runs describe one graph path; emit it once.
+ */
+static void test_shortest_nondeterminism (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 1, 1, 2 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 0, 0, 2 },
+        { 1, 1, 3 },
+        { 2, 1, 3 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 2, { 0, 0, 1, 1, 2 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 3, .automaton_states = 4,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 3 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllShortestPaths
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1 -a-> [0]
+ * NFA:  -->((q0)) -a-> q0
+ *
+ * Shortest: the zero-edge path dominates all nonempty returns to vertex 0.
+ * Vertex 1 still has the one-edge shortest path 0-a-1.
+ */
+static void test_shortest_root_and_cycle (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 1, 0, 0 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 0 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 0, { 0 } },
+        { 1, { 0, 0, 1 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 2, .automaton_states = 1,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 0 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllShortestPaths
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> [0]
+ * NFA:  -->q0 -a-> q1 -a-> ((q2))
+ *
+ * Shortest: only aa is accepted.  Its shortest path repeats the vertex and edge.
+ * Neither the zero-edge walk nor a single loop is a valid shortcut.
+ */
+static void test_shortest_requires_repeated_edge (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 0 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 1, 0, 2 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 2, { 0, 0, 0, 0, 0 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 1, .automaton_states = 3,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 2 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllShortestPaths
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -b-> 1 -b-> 2 -b-> 3
+ *          +---------------a----^
+ * NFA:  -->q0 -b-> q1 -b-> q2 -b-> ((q3))
+ *
+ * Shortest: the direct graph edge a is rejected by the language.
+ * The minimum accepted path is bbb, even though it is longer in the plain graph.
+ */
+static void test_shortest_rejected_shortcut (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 3 },
+        { 0, 1, 1 },
+        { 1, 1, 2 },
+        { 2, 1, 3 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 1, 1 },
+        { 1, 1, 2 },
+        { 2, 1, 3 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 3, { 0, 1, 1, 1, 2, 1, 3 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 4, .automaton_states = 4,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 3 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllShortestPaths
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: 0 -a-> 1 <-b- [2]
+ * NFA: ((q0)) -a-> q1 -b-> q2 <-- initial
+ *
+ * Shortest, inverse=true, inverse_labels[b]=true, QS={q2}, QF={q0}, S={2}.
+ * The accepted shortest path in query traversal order is 2-b-1-a-0.
+ */
+static void test_shortest_inverse_query (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 2, 1, 1 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 1, 1, 2 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 2, { 2, 1, 1, 0, 0 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 3, .automaton_states = 3,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 2 }, .nqs = 1,
+        .QF = { 0 }, .nqf = 1,
+        .S = { 2 }, .ns = 1,
+        .inverse_labels = { false, true, false },
+        .inverse = true,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllShortestPaths
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1
+ * NFA:  -->q0 -b-> ((q1))
+ *
+ * Shortest: no accepted path exists, so there is no minimum and no result.
+ */
+static void test_shortest_no_path (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 1, 1 }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 2, .automaton_states = 2,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 1 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = NULL,
+        .expected_count = 0,
+        .run = LAGraph_2RpqPath_AllShortestPaths
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph: [0] -a-> 1 -a-> 2 -a-> 4
+ *          +--a-> 3 --------a--^
+ *          +--a-> 5 --------a--^
+ * NFA:  -->q0 -a-> ((q1)) -a-> q1
+ *
+ * Shortest: vertex 4 is first reconstructed through predecessor 2 (length 3),
+ * then predecessor 3 improves its minimum to 2, and predecessor 5 supplies a tie.
+ * Discard only the longer path to vertex 4, preserving other destinations.
+ */
+static void test_shortest_late_shorter_and_tie (void)
+{
+    const TestEdge graph [] =
+    {
+        { 0, 0, 1 },
+        { 1, 0, 2 },
+        { 2, 0, 4 },
+        { 0, 0, 3 },
+        { 3, 0, 4 },
+        { 0, 0, 5 },
+        { 5, 0, 4 }
+    } ;
+    const TestEdge automaton [] =
+    {
+        { 0, 0, 1 },
+        { 1, 0, 1 }
+    } ;
+    const ExpectedPath expected [] =
+    {
+        { 1, { 0, 0, 1 } },
+        { 2, { 0, 0, 1, 0, 2 } },
+        { 1, { 0, 0, 3 } },
+        { 2, { 0, 0, 3, 0, 4 } },
+        { 2, { 0, 0, 5, 0, 4 } },
+        { 1, { 0, 0, 5 } }
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 6, .automaton_states = 2,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 1 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected,
+        .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllShortestPaths
+    } ;
+    test_check_query (&query) ;
+}
+
 TEST_LIST =
 {
     { "RpqPath_chain", test_chain },
@@ -952,6 +1968,31 @@ TEST_LIST =
     { "RpqPath_long_chain", test_long_chain },
     { "RpqPath_nonaccepting_cycle", test_nonaccepting_cycle },
     { "RpqPath_length_limit", test_length_limit },
+    { "RpqPath_simple_repeated_vertex", test_simple_repeated_vertex },
+    { "RpqPath_simple_self_loop", test_simple_self_loop },
+    { "RpqPath_simple_closed_path", test_simple_closed_path },
+    { "RpqPath_simple_parallel_labels", test_simple_parallel_labels },
+    { "RpqPath_simple_sources_and_roots", test_simple_sources_and_roots },
+    { "RpqPath_simple_zero_length", test_simple_zero_length },
+    { "RpqPath_trails_vertex_revisit", test_trails_vertex_revisit },
+    { "RpqPath_trails_different_labels", test_trails_different_labels },
+    { "RpqPath_trails_opposite_directions", test_trails_opposite_directions },
+    { "RpqPath_trails_repeated_edge", test_trails_repeated_edge },
+    { "RpqPath_trails_self_loop_once", test_trails_self_loop_once },
+    { "RpqPath_trails_different_targets", test_trails_different_targets },
+    { "RpqPath_trails_inverse_label", test_trails_inverse_label },
+    { "RpqPath_shortest_equal_branches", test_shortest_equal_branches },
+    { "RpqPath_shortest_per_destination", test_shortest_per_destination },
+    { "RpqPath_shortest_later_final_state", test_shortest_later_final_state },
+    { "RpqPath_shortest_sources", test_shortest_sources },
+    { "RpqPath_shortest_parallel_final_states", test_shortest_parallel_final_states },
+    { "RpqPath_shortest_nondeterminism", test_shortest_nondeterminism },
+    { "RpqPath_shortest_root_and_cycle", test_shortest_root_and_cycle },
+    { "RpqPath_shortest_requires_repeated_edge", test_shortest_requires_repeated_edge },
+    { "RpqPath_shortest_rejected_shortcut", test_shortest_rejected_shortcut },
+    { "RpqPath_shortest_inverse_query", test_shortest_inverse_query },
+    { "RpqPath_shortest_no_path", test_shortest_no_path },
+    { "RpqPath_shortest_late_shorter_and_tie", test_shortest_late_shorter_and_tie },
     { NULL, NULL }
 } ;
 
