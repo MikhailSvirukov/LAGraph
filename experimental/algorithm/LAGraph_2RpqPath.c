@@ -14,9 +14,9 @@
 // There is no visited mask: alternative predecessors and cycles must survive
 // in P.  Path semantics are checked later, during backward reconstruction.
 //
-// Increments 1 through 3 prepare the traversal and its first multiplication.
+// Increments 1 through 4 prepare the first multiplication and a block pool.
 // All owned matrices are local variables in LG_RpqPath_Traverse.
-// Predecessor allocation, the second multiplication and reconstruction follow.
+// The second multiplication, accumulation and reconstruction follow.
 // The internal workspace is not yet a public path-result interface.
 // Optimizations, including minor ones, require the user's prior approval.
 
@@ -26,6 +26,7 @@
 
 #include "LG_internal.h"
 #include "LAGraphX.h"
+#include <stdatomic.h>
 
 // Set to 0 for builds whose callers supply already validated inputs.
 // Allocation and GraphBLAS operation errors are still handled in those builds.
@@ -38,6 +39,25 @@
 // traversal, which terminates when P stops receiving new predecessor records.
 #ifndef LG_RPQ_PATH_MAX_LENGTH
 #define LG_RPQ_PATH_MAX_LENGTH 1024
+#endif
+
+// Number of predecessor records in one temporary block.  This is a baseline
+// layout constant, not a tuned value; changing it requires user approval.
+#ifndef LG_RPQ_PATH_BLOCK_CAPACITY
+#define LG_RPQ_PATH_BLOCK_CAPACITY 64
+#endif
+#if LG_RPQ_PATH_BLOCK_CAPACITY < 1
+#error "LG_RPQ_PATH_BLOCK_CAPACITY must be positive"
+#endif
+
+// Fixed number of blocks allocated before matrix operations start.  The pool
+// never grows inside a callback.  This baseline limit includes intermediate
+// values, not just the predecessor sets that survive in the final C matrix.
+#ifndef LG_RPQ_PATH_POOL_BLOCKS
+#define LG_RPQ_PATH_POOL_BLOCKS 1024
+#endif
+#if LG_RPQ_PATH_POOL_BLOCKS < 1
+#error "LG_RPQ_PATH_POOL_BLOCKS must be positive"
 #endif
 
 // One incoming product-graph edge.  Its destination is given by the P/C cell
@@ -170,15 +190,180 @@ static void LG_RpqPath_CollectState
     }
 }
 
-// Block layout and allocation are introduced in the allocator increment.
-// GraphBLAS copies this handle by value, not the blocks it will reference.
-typedef struct LG_RpqPath_PredecessorBlock LG_RpqPath_PredecessorBlock ;
+// next links blocks of one value.  Every block is a fixed-size slice of the
+// pool's single allocation and remains at the same address until pool teardown.
+typedef struct LG_RpqPath_PredecessorBlock
+{
+    size_t count ;
+    LG_RpqPath_Predecessor records [LG_RPQ_PATH_BLOCK_CAPACITY] ;
+    struct LG_RpqPath_PredecessorBlock *next ;
+}
+LG_RpqPath_PredecessorBlock ;
 
+// One contiguous allocation serves the whole traversal.  Each callback reserves
+// a distinct index with atomic_fetch_add; blocks never move and the pool never
+// grows.  Resetting the index reclaims the whole iteration, including blocks
+// whose intermediate UDT handles GraphBLAS has overwritten.  error reports
+// exhaustion from callbacks, whose void return type cannot return an error code.
 typedef struct
 {
+    LG_RpqPath_PredecessorBlock *blocks ;
+    size_t block_count ;
+    atomic_size_t next_block ;
+    atomic_int error ;
+}
+LG_RpqPath_BlockPool ;
+
+// GraphBLAS copies this handle by value, not the blocks it references.  A
+// published set must remain immutable: a copied UDT may still share its head.
+typedef struct
+{
+    LG_RpqPath_BlockPool *pool ;     // borrowed owner; alive for the traversal
     LG_RpqPath_PredecessorBlock *head ;  // NULL denotes an empty temporary set
 }
 LG_RpqPath_TemporarySet ;
+
+/**
+ * @brief Allocate one contiguous array of blocks before matrix operations.
+ *
+ * @param[in,out] pool Empty pool with initialized next_block and error atomics.
+ *     Receives the array pointer and its capacity; no callbacks may run yet.
+ * @param[in] block_count Number of blocks to allocate for the whole traversal.
+ *     The same array is reused after the index is reset between iterations.
+ * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes;
+ *     may be NULL.
+ * @return GrB_SUCCESS on success or an allocation error.  The allocation
+ *     wrapper checks block_count * sizeof(block) for overflow.  On failure,
+ *     the pool remains empty and can be safely destroyed.
+ */
+static int LG_RpqPath_PoolInit
+(
+    LG_RpqPath_BlockPool *pool,
+    size_t block_count,
+    char *msg
+)
+{
+    int info = LAGraph_Malloc ((void **) &pool->blocks, block_count,
+        sizeof (LG_RpqPath_PredecessorBlock), msg) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    pool->block_count = block_count ;
+    atomic_store (&pool->next_block, 0) ;
+    atomic_store (&pool->error, GrB_SUCCESS) ;
+    return (GrB_SUCCESS) ;
+}
+
+/**
+ * @brief Obtain an empty block from the fixed pool without allocating memory.
+ *
+ * @param[in,out] pool Non-NULL initialized traversal pool.  A unique index is
+ *     reserved atomically.  Exhaustion sets error to GrB_OUT_OF_MEMORY;
+ *     no malloc/realloc or explicit waiting loop is used.
+ * @return A block with count=0 and next=NULL, or NULL on pool exhaustion.
+ *     The pool retains ownership of the array containing this block.
+ *
+ * No individual block is returned while GraphBLAS may retain a copied handle.
+ * PoolReset reclaims all slices together after the iteration completes.
+ */
+static LG_RpqPath_PredecessorBlock *LG_RpqPath_PoolAcquire
+(
+    LG_RpqPath_BlockPool *pool
+)
+{
+    // Once an allocation failed, stop issuing further tickets.  Already
+    // running callbacks still own their distinct reserved slices until reset.
+    if (atomic_load (&pool->error) != GrB_SUCCESS) return (NULL) ;
+    size_t index = atomic_fetch_add (&pool->next_block, 1) ;
+    if (index >= pool->block_count)
+    {
+        atomic_store (&pool->error, GrB_OUT_OF_MEMORY) ;
+        return (NULL) ;
+    }
+    // &blocks[index] is base + index * sizeof(block), with no new allocation.
+    LG_RpqPath_PredecessorBlock *block = &pool->blocks[index] ;
+    block->count = 0 ;
+    block->next = NULL ;
+    return (block) ;
+}
+
+/**
+ * @brief Append one predecessor while constructing a private temporary value.
+ *
+ * @param[in,out] set Non-NULL unpublished set with an initialized pool pointer.
+ *     head may be NULL.  Its chain must not be shared with other values or
+ *     modified by another thread; only block-index reservation is atomic.
+ * @param[in] record Non-NULL predecessor record, copied into the last block.
+ *     The caller is responsible for excluding duplicates before appending.
+ * @return true on success; false if no free block remains in the pool.
+ *     Previously appended records stay valid on failure, and set->pool->error
+ *     contains GrB_OUT_OF_MEMORY for the caller to inspect after GraphBLAS
+ *     finishes.  Partial values use slices of the same array and are reclaimed
+ *     together with the rest of the iteration.
+ */
+static bool LG_RpqPath_TemporaryAppend
+(
+    LG_RpqPath_TemporarySet *set,
+    const LG_RpqPath_Predecessor *record
+)
+{
+    LG_RpqPath_PredecessorBlock *block = set->head ;
+    if (block == NULL)
+    {
+        block = LG_RpqPath_PoolAcquire (set->pool) ;
+        if (block == NULL) return (false) ;
+        set->head = block ;
+    }
+    else
+    {
+        while (block->next != NULL)
+        {
+            block = block->next ;
+        }
+        if (block->count == LG_RPQ_PATH_BLOCK_CAPACITY)
+        {
+            LG_RpqPath_PredecessorBlock *next =
+                LG_RpqPath_PoolAcquire (set->pool) ;
+            if (next == NULL) return (false) ;
+            block->next = next ;
+            block = next ;
+        }
+    }
+    block->records[block->count] = *record ;
+    block->count++ ;
+    return (true) ;
+}
+
+/**
+ * @brief Reclaim all block slices by resetting the next-allocation index.
+ *
+ * @param[in,out] pool Non-NULL initialized pool.  next_block becomes zero and
+ *     the callback error flag is cleared.  The backing allocation is retained.
+ * @pre All operations using these blocks have completed, P has received deep
+ *     copies of the needed records, and all temporary handles are discarded.
+ *     Read pool->error before calling this function if callbacks were used.
+ *
+ * No block traversal is needed.  Acquire initializes each block's header when
+ * it is issued again; old record bytes are ignored beyond the new count.
+ */
+static void LG_RpqPath_PoolReset (LG_RpqPath_BlockPool *pool)
+{
+    atomic_store (&pool->next_block, 0) ;
+    atomic_store (&pool->error, GrB_SUCCESS) ;
+}
+
+/**
+ * @brief Free all memory owned by a traversal's pool.
+ *
+ * @param[in,out] pool Non-NULL initialized pool.  The backing array is freed,
+ *     its pointer and capacity are cleared.  May be called again when empty.
+ * @pre No callbacks are active and no surviving value references these blocks.
+ *     Safe after failed pool initialization as well as a failed traversal.
+ */
+static void LG_RpqPath_PoolDestroy (LG_RpqPath_BlockPool *pool)
+{
+    LAGraph_Free ((void **) &pool->blocks, NULL) ;
+    pool->block_count = 0 ;
+    LG_RpqPath_PoolReset (pool) ;
+}
 
 // P owns its records independently of the temporary blocks used by C.
 // Appending records and deep copying their contents are implemented later.
@@ -540,7 +725,8 @@ int LG_RpqPath_Init
  * @note This increment implements H = N^T x frontier (or N x frontier for
  *     inverse queries).  The second product, accumulation and reconstruction
  *     are still missing.  No paths are returned yet.  All owned matrices and
- *     operators are released before returning.
+ *     operators and pool blocks are released before returning.  The pool is
+ *     ready for the next increment but the second product does not use it yet.
  */
 int LG_RpqPath_Traverse
 (
@@ -572,6 +758,21 @@ int LG_RpqPath_Traverse
     GrB_Semiring state_semiring = NULL ;
     GrB_Scalar state_capacity = NULL ;
     LG_RpqPath_StateSet *empty_state_set = NULL ;
+
+    // All temporary C values in this traversal will borrow this local pool.
+    // Its backing array survives iterations; the reservation index is reset.
+    LG_RpqPath_BlockPool pool =
+    {
+        .blocks = NULL,
+        .block_count = 0,
+        .next_block = ATOMIC_VAR_INIT (0),
+        .error = ATOMIC_VAR_INIT (GrB_SUCCESS)
+    } ;
+
+    // Reserve the fixed pool before any matrix operator can request a block.
+    // Partial initialization is also handled by traversal_cleanup below.
+    info = LG_RpqPath_PoolInit (&pool, LG_RPQ_PATH_POOL_BLOCKS, msg) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
 
     info = GrB_BinaryOp_new (&state_union, LG_RpqPath_UnionStates,
         work->state_set_type, work->state_set_type, work->state_set_type) ;
@@ -647,19 +848,20 @@ int LG_RpqPath_Traverse
             info = GrB_mxm (H, NULL, NULL, state_semiring,
                 work->N[a], frontier, nfa_direction) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
-            // Finish the product before its H values are consumed or freed.
-            info = GrB_Matrix_wait (H, GrB_MATERIALIZE) ;
-            if (info != GrB_SUCCESS) goto iteration_cleanup ;
-
+            // No wait between the products: GraphBLAS manages the dependency
+            // when the second multiplication consumes H as an input matrix.
             // TODO: C += H x G_a, including the label in every predecessor.
-            // Stop here until the allocator and second product are implemented.
+            // Wait for C after that product and inspect pool.error.  Reset the
+            // pool only at iteration end, after all uses of its blocks finish.
+            // The block pool is ready; the second product is the next increment.
             info = GrB_NOT_IMPLEMENTED ;
             break ;
         }
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
 
-        // TODO: Deep copy new C records into P.  Set next_frontier[p,i] only
-        // if this union adds at least one previously absent predecessor.
+        // TODO: Compare C with the OLD P using a Boolean GxB_eWiseUnion
+        // predicate for new records; remove stored false values to obtain the
+        // next frontier.  Then deep copy and union the C records into P.
         info = GrB_Matrix_nvals (&frontier_nvals, next_frontier) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
 
@@ -671,11 +873,13 @@ int LG_RpqPath_Traverse
 
 iteration_cleanup:
         // H owns its state sets inline; freeing H releases their storage too.
-        // C still has no values.  When temporary blocks are added, complete
-        // operations, copy into P and return the blocks here too.
+        // C still has no values.  The second-product increment must wait for
+        // callbacks and check pool.error before entering cleanup.  Once P is
+        // populated, its independent copies must be finished before this point.
         GrB_free (&H) ;
         GrB_free (&C) ;
         GrB_free (&next_frontier) ;
+        LG_RpqPath_PoolReset (&pool) ;
         if (info != GrB_SUCCESS) goto traversal_cleanup ;
     }
 
@@ -694,6 +898,7 @@ traversal_cleanup:
     GrB_free (&state_union) ;
     GrB_free (&state_capacity) ;
     LAGraph_Free ((void **) &empty_state_set, NULL) ;
+    LG_RpqPath_PoolDestroy (&pool) ;
     if (info == GrB_NOT_IMPLEMENTED)
     {
         LG_ERROR_MSG ("second RPQ multiplication is not implemented yet") ;
