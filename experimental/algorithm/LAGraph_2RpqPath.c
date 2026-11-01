@@ -14,9 +14,9 @@
 // There is no visited mask: alternative predecessors and cycles must survive
 // in P.  Path semantics are checked later, during backward reconstruction.
 //
-// Increments 1 and 2 prepare metadata, value types and a traversal skeleton.
+// Increments 1 through 3 prepare the traversal and its first multiplication.
 // All owned matrices are local variables in LG_RpqPath_Traverse.
-// No multiplication, predecessor allocation or reconstruction runs yet.
+// Predecessor allocation, the second multiplication and reconstruction follow.
 // The internal workspace is not yet a public path-result interface.
 // Optimizations, including minor ones, require the user's prior approval.
 
@@ -53,12 +53,122 @@ LG_RpqPath_Predecessor ;
 // H values reserve room for all nr state indices.  The GraphBLAS type size is
 // fixed for one query: sizeof this header plus nr * sizeof (GrB_Index).
 // Only the first count entries belong to the set; count == 0 means empty.
+// capacity is nr, carried with every value so the addition callback can write
+// the entire fixed-size result without global query state.  State indices are
+// stored in ascending order and unused slots are zero, giving union a canonical
+// representation independent of GraphBLAS reduction order.
 typedef struct
 {
     size_t count ;
+    size_t capacity ;
     GrB_Index states [] ;
 }
 LG_RpqPath_StateSet ;
+
+/**
+ * @brief Add two H values by taking the union of their state sets.
+ *
+ * @param[out] z GraphBLAS output buffer for one StateSet value, including its
+ *     capacity state slots.  May alias x or y; no output bytes are read before
+ *     they have been written or copied from a valid input.
+ * @param[in] x First StateSet value with sorted, distinct indices.
+ * @param[in] y Second StateSet value with sorted, distinct indices and the
+ *     same capacity as x.  Both inputs belong to the same query-specific type.
+ *
+ * The result contains sorted, distinct indices.  No allocation is performed:
+ * all states belong to [0, capacity), so the union fits the reserved slots.
+ * Merging and moving the result take O(x->count + y->count); clearing unused
+ * slots additionally takes O(capacity - result->count).
+ * This callback has the exact signature required by GrB_BinaryOp_new.
+ */
+static void LG_RpqPath_UnionStates (void *z, const void *x, const void *y)
+{
+    LG_RpqPath_StateSet *result = z ;
+    const LG_RpqPath_StateSet *left = x ;
+    const LG_RpqPath_StateSet *right = y ;
+
+    size_t i = left->count ;
+    size_t j = right->count ;
+    size_t capacity = left->capacity ;
+    size_t output = capacity ;
+
+    // Merge the largest remaining indices into the end of the output buffer.
+    // Since the union fits capacity slots, each write is past all unread
+    // indices in either input, including when result aliases left or right.
+    while (i > 0 || j > 0)
+    {
+        GrB_Index q ;
+        if (j == 0 || (i > 0 && left->states[i-1] > right->states[j-1]))
+        {
+            q = left->states[--i] ;
+        }
+        else if (i == 0 || right->states[j-1] > left->states[i-1])
+        {
+            q = right->states[--j] ;
+        }
+        else
+        {
+            // Equal indices occur once in the union; consume both inputs.
+            q = left->states[--i] ;
+            j-- ;
+        }
+        result->states[--output] = q ;
+    }
+
+    // The merged suffix is already ascending.  Move it to the beginning and
+    // restore the same canonical representation used by the singleton product.
+    size_t count = capacity - output ;
+    memmove (result->states, result->states + output,
+        count * sizeof (GrB_Index)) ;
+    result->count = count ;
+    result->capacity = capacity ;
+    memset (result->states + result->count, 0,
+        (capacity - result->count) * sizeof (GrB_Index)) ;
+}
+
+/**
+ * @brief Multiply Boolean entries into a singleton predecessor-state set.
+ *
+ * @param[out] z GraphBLAS buffer for one StateSet value with nr reserved slots.
+ * @param[in] x Boolean entry of the NFA matrix in its selected direction.
+ * @param[in] ix Row index of x in the multiplication; unused.
+ * @param[in] jx Column index of x in the multiplication; unused.
+ * @param[in] y Boolean entry of the unchanged frontier.
+ * @param[in] iy Row index of y, the predecessor NFA state q to record.
+ * @param[in] jy Column index of y, the graph vertex; unused in this product.
+ * @param[in] theta Bound GrB_UINT64 scalar containing nr, the set capacity.
+ *
+ * Returns {iy} when both Boolean entries are true, otherwise the empty set.
+ * Using the frontier's row identifies q for either N^T x M or N x M.
+ * This callback uses the exact GxB_index_binary_function signature.
+ */
+static void LG_RpqPath_CollectState
+(
+    void *z,
+    const void *x,
+    GrB_Index ix,
+    GrB_Index jx,
+    const void *y,
+    GrB_Index iy,
+    GrB_Index jy,
+    const void *theta
+)
+{
+    (void) ix ;
+    (void) jx ;
+    (void) jy ;
+    bool active = (*(const bool *) x && *(const bool *) y) ;
+    size_t capacity = (size_t) *(const uint64_t *) theta ;
+    LG_RpqPath_StateSet *result = z ;
+    memset (result, 0,
+        sizeof (LG_RpqPath_StateSet) + capacity * sizeof (GrB_Index)) ;
+    result->capacity = capacity ;
+    if (active)
+    {
+        result->count = 1 ;
+        result->states[0] = iy ;
+    }
+}
 
 // Block layout and allocation are introduced in the allocator increment.
 // GraphBLAS copies this handle by value, not the blocks it will reference.
@@ -425,11 +535,12 @@ int LG_RpqPath_Init
  *     may be NULL.  Cleared on entry.
  *
  * @return GrB_SUCCESS if no product-graph step is needed, GrB_NOT_IMPLEMENTED
- *     when a matching label requires the not-yet-written multiplications,
+ *     after the first multiplication when the second product is required,
  *     or an error from a GraphBLAS operation.
- * @note This is the increment-2 skeleton, not a path-result API.  No paths are
- *     returned yet.  Multiplication, accumulation and reconstruction are added
- *     in later increments.  All owned matrices are released before returning.
+ * @note This increment implements H = N^T x frontier (or N x frontier for
+ *     inverse queries).  The second product, accumulation and reconstruction
+ *     are still missing.  No paths are returned yet.  All owned matrices and
+ *     operators are released before returning.
  */
 int LG_RpqPath_Traverse
 (
@@ -451,6 +562,47 @@ int LG_RpqPath_Traverse
     GrB_Matrix roots = NULL ;
     GrB_Matrix frontier = NULL ;
     GrB_Index frontier_nvals = 0 ;
+
+    // The first product uses one query-specific semiring for all labels.
+    // Operators are local to this traversal, just like its matrices.
+    GrB_BinaryOp state_union = NULL ;
+    GrB_Monoid state_union_monoid = NULL ;
+    GxB_IndexBinaryOp collect_state = NULL ;
+    GrB_BinaryOp state_multiply = NULL ;
+    GrB_Semiring state_semiring = NULL ;
+    GrB_Scalar state_capacity = NULL ;
+    LG_RpqPath_StateSet *empty_state_set = NULL ;
+
+    info = GrB_BinaryOp_new (&state_union, LG_RpqPath_UnionStates,
+        work->state_set_type, work->state_set_type, work->state_set_type) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+
+    // The identity occupies the full UDT size, not just its C struct header.
+    // GrB_Monoid_new_UDT copies those bytes; the source buffer is then released.
+    size_t state_set_size = sizeof (LG_RpqPath_StateSet) +
+        (size_t) work->nr * sizeof (GrB_Index) ;
+    info = LAGraph_Calloc ((void **) &empty_state_set, 1, state_set_size, msg) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    empty_state_set->capacity = (size_t) work->nr ;
+    info = GrB_Monoid_new_UDT (&state_union_monoid, state_union,
+        empty_state_set) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    LAGraph_Free ((void **) &empty_state_set, NULL) ;
+
+    info = GxB_IndexBinaryOp_new (&collect_state, LG_RpqPath_CollectState,
+        work->state_set_type, GrB_BOOL, GrB_BOOL, GrB_UINT64,
+        "LG_RpqPath_CollectState", NULL) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    info = GrB_Scalar_new (&state_capacity, GrB_UINT64) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    info = GrB_Scalar_setElement_UINT64 (state_capacity, (uint64_t) work->nr) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    info = GxB_BinaryOp_new_IndexOp (&state_multiply, collect_state,
+        state_capacity) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    info = GrB_Semiring_new (&state_semiring, state_union_monoid,
+        state_multiply) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
 
     info = GrB_Matrix_new (&P, work->stored_set_type, work->nr, work->ng) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
@@ -487,9 +639,20 @@ int LG_RpqPath_Traverse
         {
             if (work->A[a] == NULL || work->N[a] == NULL) continue ;
 
-            // TODO: H = N_a^T x frontier, then C += H x G_a, with the
-            // appropriate transpose descriptors for reversed traversal.
-            // Until those increments exist, report incomplete work explicitly.
+            // H[p,j] = {q | N_a[q,p] && frontier[q,j]} for a direct query.
+            // Inverse queries instead follow the original N_a rows.  REPLACE
+            // discards the previous label's H values; frontier is only read.
+            GrB_Descriptor nfa_direction = work->inverse ?
+                GrB_DESC_R : GrB_DESC_RT0 ;
+            info = GrB_mxm (H, NULL, NULL, state_semiring,
+                work->N[a], frontier, nfa_direction) ;
+            if (info != GrB_SUCCESS) goto iteration_cleanup ;
+            // Finish the product before its H values are consumed or freed.
+            info = GrB_Matrix_wait (H, GrB_MATERIALIZE) ;
+            if (info != GrB_SUCCESS) goto iteration_cleanup ;
+
+            // TODO: C += H x G_a, including the label in every predecessor.
+            // Stop here until the allocator and second product are implemented.
             info = GrB_NOT_IMPLEMENTED ;
             break ;
         }
@@ -507,8 +670,9 @@ int LG_RpqPath_Traverse
         next_frontier = NULL ;
 
 iteration_cleanup:
-        // These matrices hold no sets yet.  When temporary blocks are added,
-        // complete operations, copy into P and return the blocks here too.
+        // H owns its state sets inline; freeing H releases their storage too.
+        // C still has no values.  When temporary blocks are added, complete
+        // operations, copy into P and return the blocks here too.
         GrB_free (&H) ;
         GrB_free (&C) ;
         GrB_free (&next_frontier) ;
@@ -522,9 +686,17 @@ traversal_cleanup:
     // P is still empty.  Once populated, release its owned record arrays here
     // as well: GrB_free alone does not free pointers stored inside UDT values.
     GrB_free (&P) ;
+    // Matrices have been released; their operators can now be released too.
+    GrB_free (&state_semiring) ;
+    GrB_free (&state_multiply) ;
+    GrB_free (&collect_state) ;
+    GrB_free (&state_union_monoid) ;
+    GrB_free (&state_union) ;
+    GrB_free (&state_capacity) ;
+    LAGraph_Free ((void **) &empty_state_set, NULL) ;
     if (info == GrB_NOT_IMPLEMENTED)
     {
-        LG_ERROR_MSG ("RPQ traversal multiplications are not implemented yet") ;
+        LG_ERROR_MSG ("second RPQ multiplication is not implemented yet") ;
     }
     else if (info != GrB_SUCCESS)
     {
