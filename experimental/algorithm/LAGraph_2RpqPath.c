@@ -14,9 +14,9 @@
 // There is no visited mask: alternative predecessors and cycles must survive
 // in P.  Path semantics are checked later, during backward reconstruction.
 //
-// Increments 1 through 5 implement both products and temporary predecessor sets.
+// Increments 1 through 6 build the predecessor relation to a fixed point.
 // All owned matrices are local variables in LG_RpqPath_Traverse.
-// Accumulation into P and reconstruction follow in later increments.
+// Path reconstruction follows in later increments.
 // The internal workspace is not yet a public path-result interface.
 // Optimizations, including minor ones, require the user's prior approval.
 
@@ -551,14 +551,277 @@ static void LG_RpqPath_PoolDestroy (LG_RpqPath_BlockPool *pool)
     LG_RpqPath_PoolReset (pool) ;
 }
 
-// P owns its records independently of the temporary blocks used by C.
-// Appending records and deep copying their contents are implemented later.
+// Each P buffer is one allocation containing its ownership link and records.
+// Old and new P buffers are tracked separately during an in-place eWiseUnion.
+// GraphBLAS only copies their handles and does not manage the pointed-to memory.
+typedef struct LG_RpqPath_StoredAllocation
+{
+    struct LG_RpqPath_StoredAllocation *next ;
+    LG_RpqPath_Predecessor records [] ;
+}
+LG_RpqPath_StoredAllocation ;
+
+// P values refer to ordinary heap allocations, never to the temporary arena.
+// count records are valid and sorted by (state, vertex, label).
 typedef struct
 {
     size_t count ;
-    LG_RpqPath_Predecessor *records ;    // malloc/realloc storage; NULL if empty
+    LG_RpqPath_StoredAllocation *allocation ; // NULL denotes the empty set
 }
 LG_RpqPath_StoredSet ;
+
+// Callbacks may allocate concurrently.  They only prepend to this owner list;
+// nothing is removed or freed until all callbacks have completed.  This is
+// independent of the unchanged fixed-block pool used by temporary C values.
+typedef struct
+{
+    _Atomic (LG_RpqPath_StoredAllocation *) allocations ;
+    atomic_int error ;
+}
+LG_RpqPath_StoredOwner ;
+
+// Bound scalar for P's mixed-type binary operator; indices are not needed.
+typedef struct
+{
+    LG_RpqPath_StoredOwner *owner ;
+}
+LG_RpqPath_StoredContext ;
+
+/**
+ * @brief Determine whether a C value contains a record absent from the old P.
+ *
+ * @param[out] z Output bool for GxB_eWiseUnion; true iff x adds a predecessor.
+ * @param[in] x Sorted TemporarySet from C, or its empty substitute scalar.
+ * @param[in] y Sorted StoredSet from P, or its empty substitute scalar.
+ *
+ * Both operands are read-only.  Missing and explicitly empty cells have the
+ * same set semantics.  C-only positions compare against empty P and P-only
+ * positions compare against empty C.  No allocation or mutation is performed.
+ */
+static void LG_RpqPath_HasNewPredecessors (void *z, const void *x, const void *y)
+{
+    const LG_RpqPath_TemporarySet *temporary = x ;
+    const LG_RpqPath_StoredSet *stored = y ;
+    const LG_RpqPath_PredecessorBlock *block = temporary->head ;
+    size_t temporary_index = 0, stored_index = 0 ;
+
+    while (block != NULL)
+    {
+        if (stored_index == stored->count)
+        {
+            *(bool *) z = true ;
+            return ;
+        }
+        int order = LG_RpqPath_ComparePredecessors (
+            &block->records[temporary_index],
+            &stored->allocation->records[stored_index]) ;
+        if (order < 0)
+        {
+            *(bool *) z = true ;
+            return ;
+        }
+        if (order == 0)
+        {
+            LG_RpqPath_TemporaryAdvance (&block, &temporary_index) ;
+        }
+        stored_index++ ;
+    }
+    *(bool *) z = false ;
+}
+
+/**
+ * @brief Allocate an independent P record buffer and register its owner.
+ *
+ * @param[in,out] owner Non-NULL owner of the new P buffers.  Concurrent
+ *     registrations are allowed; removal is deferred until callbacks finish.
+ * @param[in] capacity Number of record slots to allocate in the new buffer.
+ * @param[out] result Non-NULL output initialized to an empty StoredSet.  On
+ *     success it references the registered allocation, with count still zero.
+ * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes.
+ * @return GrB_SUCCESS or an allocation error.  Registration happens before
+ *     the handle can be given to GraphBLAS, so error cleanup never needs to
+ *     discover ownership by reading a potentially failed output matrix.
+ */
+static int LG_RpqPath_StoredAllocate
+(
+    LG_RpqPath_StoredOwner *owner,
+    size_t capacity,
+    LG_RpqPath_StoredSet *result,
+    char *msg
+)
+{
+    result->count = 0 ;
+    result->allocation = NULL ;
+    if (capacity > (SIZE_MAX - sizeof (LG_RpqPath_StoredAllocation)) /
+        sizeof (LG_RpqPath_Predecessor))
+    {
+        LG_ERROR_MSG ("stored predecessor set size exceeds addressable memory") ;
+        return (GrB_OUT_OF_MEMORY) ;
+    }
+    size_t bytes = sizeof (LG_RpqPath_StoredAllocation) +
+        capacity * sizeof (LG_RpqPath_Predecessor) ;
+    LG_RpqPath_StoredAllocation *allocation = NULL ;
+    int info = LAGraph_Malloc ((void **) &allocation, 1, bytes, msg) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    // Only the new private node's link changes on a retry.  Existing nodes
+    // remain immutable, and none can be freed while registration is active.
+    LG_RpqPath_StoredAllocation *head = atomic_load (&owner->allocations) ;
+    do
+    {
+        allocation->next = head ;
+    }
+    while (!atomic_compare_exchange_weak (&owner->allocations, &head,
+        allocation)) ;
+    result->allocation = allocation ;
+    return (GrB_SUCCESS) ;
+}
+
+/**
+ * @brief Free all P buffers registered with an owner.
+ *
+ * @param[in,out] owner Non-NULL initialized owner.  Its list is cleared and
+ *     error flag reset; calling again on an empty owner is safe.
+ * @pre No callback is registering buffers, and no surviving matrix value or
+ *     pending operation uses them.  Wait for P before releasing its old owner.
+ */
+static void LG_RpqPath_StoredRelease (LG_RpqPath_StoredOwner *owner)
+{
+    LG_RpqPath_StoredAllocation *allocation =
+        atomic_exchange (&owner->allocations, NULL) ;
+    while (allocation != NULL)
+    {
+        LG_RpqPath_StoredAllocation *next = allocation->next ;
+        LAGraph_Free ((void **) &allocation, NULL) ;
+        allocation = next ;
+    }
+    atomic_store (&owner->error, GrB_SUCCESS) ;
+}
+
+/**
+ * @brief Deep-copy a stored set and a temporary set into their sorted union.
+ *
+ * @param[in] stored Immutable old P value; an empty value has count=0.
+ * @param[in] temporary Immutable C value, with sorted distinct records.
+ * @param[in,out] owner Non-NULL owner registering all new P buffers.
+ * @param[out] result Receives a newly allocated union with no arena references
+ *     and no shared record storage with stored.  All equal records occur once.
+ * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes.
+ * @return GrB_SUCCESS or GrB_OUT_OF_MEMORY.  Inputs remain unchanged on failure.
+ *     The result allocation, once created, belongs to owner until freed.
+ */
+static int LG_RpqPath_MergeStoredSet
+(
+    const LG_RpqPath_StoredSet *stored,
+    const LG_RpqPath_TemporarySet *temporary,
+    LG_RpqPath_StoredOwner *owner,
+    LG_RpqPath_StoredSet *result,
+    char *msg
+)
+{
+    // Determine the allocation bound without relying on a fixed set capacity.
+    // Duplicate removal during merging may leave unused slots in this buffer.
+    size_t capacity = stored->count ;
+    for (const LG_RpqPath_PredecessorBlock *block = temporary->head ;
+         block != NULL ; block = block->next)
+    {
+        if (block->count > SIZE_MAX - capacity)
+        {
+            LG_ERROR_MSG ("stored predecessor count exceeds addressable memory") ;
+            return (GrB_OUT_OF_MEMORY) ;
+        }
+        capacity += block->count ;
+    }
+    int info = LG_RpqPath_StoredAllocate (owner, capacity, result, msg) ;
+    if (info != GrB_SUCCESS) return (info) ;
+
+    const LG_RpqPath_PredecessorBlock *block = temporary->head ;
+    size_t temporary_index = 0, stored_index = 0 ;
+    while (block != NULL || stored_index < stored->count)
+    {
+        const LG_RpqPath_Predecessor *record ;
+        if (block == NULL)
+        {
+            record = &stored->allocation->records[stored_index++] ;
+        }
+        else if (stored_index == stored->count)
+        {
+            record = &block->records[temporary_index] ;
+            LG_RpqPath_TemporaryAdvance (&block, &temporary_index) ;
+        }
+        else
+        {
+            const LG_RpqPath_Predecessor *temporary_record =
+                &block->records[temporary_index] ;
+            const LG_RpqPath_Predecessor *stored_record =
+                &stored->allocation->records[stored_index] ;
+            int order = LG_RpqPath_ComparePredecessors (
+                temporary_record, stored_record) ;
+            record = (order <= 0) ? temporary_record : stored_record ;
+            if (order <= 0)
+            {
+                LG_RpqPath_TemporaryAdvance (&block, &temporary_index) ;
+            }
+            if (order >= 0) stored_index++ ;
+        }
+        result->allocation->records[result->count++] = *record ;
+    }
+    return (GrB_SUCCESS) ;
+}
+
+/**
+ * @brief Produce a deep-copied P value from a C value and the old P value.
+ *
+ * @param[out] z StoredSet result, with an independent sorted record buffer.
+ * @param[in] x TemporarySet from C, or the empty substitute scalar.
+ * @param[in] ix Row of x; unused because records contain all required fields.
+ * @param[in] jx Column of x; unused.
+ * @param[in] y StoredSet from the old P, or the empty substitute scalar.
+ * @param[in] iy Row of y; unused.
+ * @param[in] jy Column of y; unused.
+ * @param[in] theta Non-NULL bound StoredContext with the new buffers' owner.
+ *
+ * Used by eWiseUnion at every position of C union P, including P-only cells.
+ * All records are copied by value; neither input buffer is modified or freed.
+ * Input handles are captured before writing z, which may alias an input.
+ * On failure the result is empty and the owner's error flag is set.  After
+ * waiting for P, the caller checks that flag before accepting the new P.
+ */
+static void LG_RpqPath_MergePredecessors
+(
+    void *z,
+    const void *x,
+    GrB_Index ix,
+    GrB_Index jx,
+    const void *y,
+    GrB_Index iy,
+    GrB_Index jy,
+    const void *theta
+)
+{
+    (void) ix ;
+    (void) jx ;
+    (void) iy ;
+    (void) jy ;
+    LG_RpqPath_TemporarySet temporary =
+        *(const LG_RpqPath_TemporarySet *) x ;
+    LG_RpqPath_StoredSet stored = *(const LG_RpqPath_StoredSet *) y ;
+    const LG_RpqPath_StoredContext *context = theta ;
+    LG_RpqPath_StoredSet result = { .count = 0, .allocation = NULL } ;
+
+    if (atomic_load (&context->owner->error) == GrB_SUCCESS)
+    {
+        int info = LG_RpqPath_MergeStoredSet (&stored, &temporary,
+            context->owner, &result, NULL) ;
+        if (info != GrB_SUCCESS)
+        {
+            int expected = GrB_SUCCESS ;
+            atomic_compare_exchange_strong (&context->owner->error,
+                &expected, info) ;
+            result = (LG_RpqPath_StoredSet) { .count = 0, .allocation = NULL } ;
+        }
+    }
+    *(LG_RpqPath_StoredSet *) z = result ;
+}
 
 typedef struct
 {
@@ -905,13 +1168,12 @@ int LG_RpqPath_Init
  * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes;
  *     may be NULL.  Cleared on entry.
  *
- * @return GrB_SUCCESS if no product-graph step is needed, GrB_NOT_IMPLEMENTED
- *     when C needs accumulation into P, GrB_OUT_OF_MEMORY if the pool is
- *     exhausted, or an error from a GraphBLAS operation.
- * @note Both products are implemented, including reversed traversal.  The
- *     accumulation and reconstruction are still missing; no paths are returned
- *     yet.  All owned matrices, operators and pool blocks are released before
- *     returning.
+ * @return GrB_SUCCESS when P reaches a fixed point, GrB_OUT_OF_MEMORY on
+ *     allocation failure or pool exhaustion, or a GraphBLAS error code.
+ * @note Builds P using both products and deep-copy accumulation.  The next
+ *     frontier marks exactly the cells receiving new predecessor records.
+ *     Reconstruction is still missing; no paths are returned yet.  All owned
+ *     matrices, operators, stored buffers and arena memory are released here.
  */
 int LG_RpqPath_Traverse
 (
@@ -934,6 +1196,11 @@ int LG_RpqPath_Traverse
     GrB_Matrix roots = NULL ;
     GrB_Matrix frontier = NULL ;
     GrB_Index frontier_nvals = 0 ;
+    LG_RpqPath_StoredOwner stored_owner =
+    {
+        .allocations = ATOMIC_VAR_INIT (NULL),
+        .error = ATOMIC_VAR_INIT (GrB_SUCCESS)
+    } ;
 
     // The first product uses one query-specific semiring for all labels.
     // Operators are local to this traversal, just like its matrices.
@@ -951,6 +1218,16 @@ int LG_RpqPath_Traverse
     GrB_Monoid predecessor_union_monoid = NULL ;
     GxB_IndexBinaryOp collect_predecessors = NULL ;
     GrB_Type predecessor_context_type = NULL ;
+
+    // Read-only comparison of C with the old P produces Boolean change flags.
+    GrB_BinaryOp has_new_predecessors = NULL ;
+    GrB_Scalar empty_temporary = NULL ;
+    GrB_Scalar empty_stored = NULL ;
+
+    // A second mixed operator returns StoredSet instead of bool.  Its bound
+    // context selects the owner for newly allocated P buffers each iteration.
+    GxB_IndexBinaryOp merge_predecessors = NULL ;
+    GrB_Type stored_context_type = NULL ;
 
     // All temporary C values in this traversal will borrow this local pool.
     // Its backing array survives iterations; the reservation index is reset.
@@ -1016,6 +1293,28 @@ int LG_RpqPath_Traverse
         "LG_RpqPath_CollectPredecessors", NULL) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
 
+    info = GrB_BinaryOp_new (&has_new_predecessors,
+        LG_RpqPath_HasNewPredecessors, GrB_BOOL,
+        work->temporary_set_type, work->stored_set_type) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    info = GrB_Type_new (&stored_context_type,
+        sizeof (LG_RpqPath_StoredContext)) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    info = GxB_IndexBinaryOp_new (&merge_predecessors,
+        LG_RpqPath_MergePredecessors, work->stored_set_type,
+        work->temporary_set_type, work->stored_set_type, stored_context_type,
+        "LG_RpqPath_MergePredecessors", NULL) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    info = GrB_Scalar_new (&empty_temporary, work->temporary_set_type) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    info = GrB_Scalar_setElement_UDT (empty_temporary, &empty_predecessor_set) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    info = GrB_Scalar_new (&empty_stored, work->stored_set_type) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    LG_RpqPath_StoredSet empty_stored_set = { .count = 0, .allocation = NULL } ;
+    info = GrB_Scalar_setElement_UDT (empty_stored, &empty_stored_set) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+
     info = GrB_Matrix_new (&P, work->stored_set_type, work->nr, work->ng) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
     info = GrB_Matrix_new (&roots, GrB_BOOL, work->nr, work->ng) ;
@@ -1037,7 +1336,15 @@ int LG_RpqPath_Traverse
         GrB_Matrix H = NULL ;
         GrB_Matrix C = NULL ;
         GrB_Matrix next_frontier = NULL ;
-        bool have_products = false ;
+
+        LG_RpqPath_StoredOwner next_stored_owner =
+        {
+            .allocations = ATOMIC_VAR_INIT (NULL),
+            .error = ATOMIC_VAR_INIT (GrB_SUCCESS)
+        } ;
+        GrB_Scalar stored_context = NULL ;
+        GrB_BinaryOp stored_merge = NULL ;
+        bool updating_P = false ;
 
         // A bound index operator copies its scalar, so the multiplier and its
         // semiring must be recreated when the label changes.  Keep their
@@ -1101,20 +1408,54 @@ int LG_RpqPath_Traverse
             GrB_free (&predecessor_semiring) ;
             GrB_free (&predecessor_multiply) ;
             GrB_free (&predecessor_context) ;
-            have_products = true ;
         }
 
-        // Do not pretend that a populated C has been saved or that the next
-        // frontier has been computed: those are the next approved increment.
-        if (have_products)
-        {
-            info = GrB_NOT_IMPLEMENTED ;
-            goto iteration_cleanup ;
-        }
+        // Compare against the OLD P, substituting an empty set wherever a
+        // cell is absent on either side.  eWiseUnion applies the predicate
+        // at C-only and P-only positions too; ordinary eWiseAdd would copy
+        // those UDT values instead of producing the required Boolean result.
+        info = GxB_Matrix_eWiseUnion (next_frontier, NULL, NULL,
+            has_new_predecessors, C, empty_temporary, P, empty_stored,
+            GrB_DESC_R) ;
+        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+        // nvals counts explicit false entries too.  Retain only true flags
+        // before using this matrix as the next Boolean frontier.
+        info = GrB_Matrix_select_BOOL (next_frontier, NULL, NULL,
+            GrB_VALUEEQ_BOOL, next_frontier, true, GrB_DESC_R) ;
+        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+        info = GrB_Matrix_wait (next_frontier, GrB_MATERIALIZE) ;
+        if (info != GrB_SUCCESS) goto iteration_cleanup ;
 
-        // TODO: Compare C with the OLD P using a Boolean GxB_eWiseUnion
-        // predicate for new records; remove stored false values to obtain the
-        // next frontier.  Then deep copy and union the C records into P.
+        // All readers used for frontier construction have finished.  Bind a
+        // separate owner so the old P buffers stay alive throughout the merge.
+        LG_RpqPath_StoredContext context = { .owner = &next_stored_owner } ;
+        info = GrB_Scalar_new (&stored_context, stored_context_type) ;
+        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+        info = GrB_Scalar_setElement_UDT (stored_context, &context) ;
+        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+        info = GxB_BinaryOp_new_IndexOp (&stored_merge, merge_predecessors,
+            stored_context) ;
+        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+
+        // Update the same P matrix handle.  Every position, including P-only
+        // cells, gets a fully copied sorted union with no old-buffer or arena
+        // references.  Ordinary eWiseAdd would bypass the operator for cells
+        // present on only one side and cannot handle these mixed UDT types.
+        updating_P = true ;
+        info = GxB_Matrix_eWiseUnion (P, NULL, NULL, stored_merge,
+            C, empty_temporary, P, empty_stored, NULL) ;
+        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+        info = GrB_Matrix_wait (P, GrB_MATERIALIZE) ;
+        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+        info = atomic_load (&next_stored_owner.error) ;
+        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+
+        // P now refers only to the new owner.  Release all former buffers and
+        // transfer ownership; no matrix tuple extraction is needed for cleanup.
+        LG_RpqPath_StoredRelease (&stored_owner) ;
+        atomic_store (&stored_owner.allocations,
+            atomic_exchange (&next_stored_owner.allocations, NULL)) ;
+        updating_P = false ;
         info = GrB_Matrix_nvals (&frontier_nvals, next_frontier) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
 
@@ -1125,25 +1466,43 @@ int LG_RpqPath_Traverse
         next_frontier = NULL ;
 
 iteration_cleanup:
-        // On error, finish any pending C computation before invalidating its
-        // block handles.  Preserve the original error if cleanup also fails.
+        // A pending change predicate may still read both old P and C.  Wait
+        // before releasing C's arena handles, including on a failed operation.
+        // Preserve the original error if cleanup also fails.
+        if (next_frontier != NULL)
+        {
+            int cleanup_info = GrB_Matrix_wait (next_frontier, GrB_MATERIALIZE) ;
+            if (info == GrB_SUCCESS) info = cleanup_info ;
+        }
         if (C != NULL)
         {
             int cleanup_info = GrB_Matrix_wait (C, GrB_MATERIALIZE) ;
             if (info == GrB_SUCCESS) info = cleanup_info ;
+        }
+        if (updating_P)
+        {
+            // A failed in-place merge may leave handles from either owner in
+            // P.  Finish pending callbacks and discard P before freeing either
+            // owner's buffers or resetting C's arena.
+            int cleanup_info = GrB_Matrix_wait (P, GrB_MATERIALIZE) ;
+            if (info == GrB_SUCCESS) info = cleanup_info ;
+            GrB_free (&P) ;
         }
         int pool_info = atomic_load (&pool.error) ;
         if (pool_info == GrB_OUT_OF_MEMORY) pool_exhausted = true ;
         if (info == GrB_SUCCESS) info = pool_info ;
         // H owns its state sets inline; freeing H releases their storage too.
         // C only holds arena handles, so free C before resetting that arena.
-        // Once P is populated, its deep copies must finish before this point.
+        // P replacements have finished and own independent record buffers.
         GrB_free (&H) ;
         GrB_free (&C) ;
         GrB_free (&next_frontier) ;
         GrB_free (&predecessor_semiring) ;
         GrB_free (&predecessor_multiply) ;
         GrB_free (&predecessor_context) ;
+        GrB_free (&stored_merge) ;
+        GrB_free (&stored_context) ;
+        LG_RpqPath_StoredRelease (&next_stored_owner) ;
         LG_RpqPath_PoolReset (&pool) ;
         if (info != GrB_SUCCESS) goto traversal_cleanup ;
     }
@@ -1152,10 +1511,16 @@ iteration_cleanup:
 traversal_cleanup:
     GrB_free (&frontier) ;
     GrB_free (&roots) ;
-    // P is still empty.  Once populated, release its owned record arrays here
-    // as well: GrB_free alone does not free pointers stored inside UDT values.
+    // Drop all matrix handles before freeing any surviving stored buffers.
+    // The owner list also tracks buffers whose handles GraphBLAS discarded.
     GrB_free (&P) ;
+    LG_RpqPath_StoredRelease (&stored_owner) ;
     // Matrices have been released; their operators can now be released too.
+    GrB_free (&has_new_predecessors) ;
+    GrB_free (&merge_predecessors) ;
+    GrB_free (&stored_context_type) ;
+    GrB_free (&empty_temporary) ;
+    GrB_free (&empty_stored) ;
     GrB_free (&collect_predecessors) ;
     GrB_free (&predecessor_union_monoid) ;
     GrB_free (&predecessor_union) ;
@@ -1168,15 +1533,11 @@ traversal_cleanup:
     GrB_free (&state_capacity) ;
     LAGraph_Free ((void **) &empty_state_set, NULL) ;
     LG_RpqPath_PoolDestroy (&pool) ;
-    if (info == GrB_NOT_IMPLEMENTED)
-    {
-        LG_ERROR_MSG ("RPQ predecessor accumulation is not implemented yet") ;
-    }
-    else if (info == GrB_OUT_OF_MEMORY && pool_exhausted)
+    if (info == GrB_OUT_OF_MEMORY && pool_exhausted)
     {
         LG_ERROR_MSG ("RPQ predecessor block pool is exhausted") ;
     }
-    else if (info != GrB_SUCCESS)
+    else if (info != GrB_SUCCESS && (msg == NULL || msg[0] == '\0'))
     {
         LG_ERROR_MSG ("GraphBLAS failure during RPQ traversal: info: %d", info) ;
     }
