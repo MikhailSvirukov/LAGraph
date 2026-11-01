@@ -6,7 +6,6 @@
 #include "LAGraphX.h"
 #include <errno.h>
 #include <inttypes.h>
-#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -16,13 +15,6 @@ typedef int (*QueryFunction)
     const GrB_Index *, size_t, const GrB_Index *, size_t, LAGraph_Graph *,
     const GrB_Index *, size_t, bool, char *
 ) ;
-
-typedef struct
-{
-    int64_t label ;
-    LAGraph_Graph graph ;
-}
-GraphLabel ;
 
 /** Read a square Matrix Market matrix, cast values to bool and materialize it.
  * @param[out] graph Receives an owned graph, or NULL on error.
@@ -71,7 +63,7 @@ cleanup:
 }
 
 /** Read a counted list of one-based NFA states and convert them to zero-based.
- * @param[in] file Open meta.txt stream, positioned before the list's count.
+ * @param[in] file Open metadata stream, positioned before the list's count.
  * @param[out] states Receives an owned array, including partial setup on error.
  * @param[out] count Receives the number of entries.
  * @param[out] msg Optional LAGRAPH_MSG_LEN-byte error buffer.
@@ -95,49 +87,80 @@ static int read_states
     return (GrB_SUCCESS) ;
 }
 
-/** Execute one query directory, printing query/time_seconds/path_count on success.
- * @param[in] directory Numbered query directory with meta.txt and label matrices.
- * @param[in] graph Loaded graph labels, borrowed; loaded once for the whole batch.
- * @param[in] graph_count Number of graph labels.
- * @param[in] ng Shared graph vertex count.
+/** Read an uncounted list of one-based graph source vertices.
+ * @param[in] path Sources filename; whitespace separates vertex IDs.
+ * @param[out] sources Receives an owned array, including partial setup on error.
+ * @param[out] count Receives the number of entries; an empty file means no sources.
+ * @param[out] msg Optional LAGRAPH_MSG_LEN-byte error buffer.
+ * @return GrB_SUCCESS or an input/allocation error.
+ */
+static int read_sources
+(
+    const char *path, GrB_Index **sources, size_t *count, char *msg
+)
+{
+    FILE *file = fopen (path, "r") ;
+    if (file == NULL)
+    {
+        fprintf (stderr, "%s: %s\n", path, strerror (errno)) ;
+        return (GrB_INVALID_VALUE) ;
+    }
+    *count = 0 ;
+    uint64_t vertex ;
+    int scanned, info = GrB_SUCCESS ;
+    while ((scanned = fscanf (file, "%" SCNu64, &vertex)) == 1)
+    {
+        if (vertex == 0) { info = GrB_INVALID_VALUE ; goto cleanup ; }
+        (*count)++ ;
+    }
+    if (scanned != EOF || ferror (file))
+    {
+        info = GrB_INVALID_VALUE ;
+        goto cleanup ;
+    }
+    rewind (file) ;
+    info = LAGraph_Malloc ((void **) sources, *count, sizeof (GrB_Index), msg) ;
+    if (info != GrB_SUCCESS) goto cleanup ;
+    for (size_t k = 0 ; k < *count ; k++)
+    {
+        if (fscanf (file, "%" SCNu64, &vertex) != 1 || vertex == 0)
+        {
+            info = GrB_INVALID_VALUE ;
+            goto cleanup ;
+        }
+        (*sources)[k] = vertex - 1 ;
+    }
+cleanup:
+    fclose (file) ;
+    return (info) ;
+}
+
+/** Load one NFA and its sources, call the API and print its time and path count.
+ * @param[in] files Query number, metadata path, sources path, then nl NFA paths.
+ *     A path of "-" denotes an absent NFA label.
+ * @param[in] G Borrowed graph decomposition, loaded once for the whole batch.
+ * @param[in] nl Number of label slots shared by G and the NFA path list.
  * @param[in] query Selected public query function.
  * @param[out] msg Optional LAGRAPH_MSG_LEN-byte error buffer.
  * @return GrB_SUCCESS or an input/allocation/algorithm error.
  */
 static int run_query
 (
-    const char *directory, const GraphLabel *graph, size_t graph_count,
-    GrB_Index ng, QueryFunction query, char *msg
+    char *const *files, LAGraph_Graph *G, size_t nl,
+    QueryFunction query, char *msg
 )
 {
-    char *path = NULL ;
     FILE *meta = NULL ;
     GrB_Index *QS = NULL, *QF = NULL, *S = NULL ;
-    LAGraph_Graph *G = NULL, *R = NULL ;
+    LAGraph_Graph *R = NULL ;
     bool *inverse_labels = NULL ;
     LAGraph_RpqPath *paths = NULL ;
-    size_t nqs = 0, nqf = 0, ns = 0, nl = 0, path_count = 0 ;
-    uint64_t source = 0, target = 0 ;
-    size_t path_size = strlen (directory) + 64 ;
-    int info = LAGraph_Malloc ((void **) &path, path_size, 1, msg) ;
-    if (info != GrB_SUCCESS) goto cleanup ;
-    snprintf (path, path_size, "%s/meta.txt", directory) ;
-    meta = fopen (path, "r") ;
+    size_t nqs = 0, nqf = 0, ns = 0, path_count = 0 ;
+    int info = GrB_SUCCESS ;
+    meta = fopen (files[1], "r") ;
     if (meta == NULL)
     {
-        info = GrB_INVALID_VALUE ;
-        goto cleanup ;
-    }
-    if (fscanf (meta, "%" SCNu64 " %" SCNu64, &source, &target) != 2 ||
-        source > ng || target > ng)
-    {
-        info = GrB_INVALID_VALUE ;
-        goto cleanup ;
-    }
-    if (target != 0)
-    {
-        fprintf (stderr, "%s: fixed targets are unsupported by the benchmark; "
-            "the public API returns paths to all accepting endpoints\n", directory) ;
+        fprintf (stderr, "%s: %s\n", files[1], strerror (errno)) ;
         info = GrB_INVALID_VALUE ;
         goto cleanup ;
     }
@@ -145,12 +168,9 @@ static int run_query
     if (info != GrB_SUCCESS) goto cleanup ;
     info = read_states (meta, &QF, &nqf, msg) ;
     if (info != GrB_SUCCESS) goto cleanup ;
-    if (fscanf (meta, "%zu", &nl) != 1 || nl == 0)
-    {
-        info = GrB_INVALID_VALUE ;
-        goto cleanup ;
-    }
-    info = LAGraph_Calloc ((void **) &G, nl, sizeof (LAGraph_Graph), msg) ;
+    fclose (meta) ;
+    meta = NULL ;
+    info = read_sources (files[2], &S, &ns, msg) ;
     if (info != GrB_SUCCESS) goto cleanup ;
     info = LAGraph_Calloc ((void **) &R, nl, sizeof (LAGraph_Graph), msg) ;
     if (info != GrB_SUCCESS) goto cleanup ;
@@ -158,36 +178,10 @@ static int run_query
     if (info != GrB_SUCCESS) goto cleanup ;
     for (size_t a = 0 ; a < nl ; a++)
     {
-        int64_t label ;
-        if (fscanf (meta, "%" SCNd64, &label) != 1 || label == 0 ||
-            label == INT64_MIN)
-        {
-            info = GrB_INVALID_VALUE ;
-            goto cleanup ;
-        }
-        int64_t absolute = label < 0 ? -label : label ;
-        for (size_t k = 0 ; k < graph_count ; k++)
-            if (graph[k].label == absolute) G[a] = graph[k].graph ;
-        if (G[a] == NULL)
-        {
-            fprintf (stderr, "%s: missing graph matrix for label %" PRId64 "\n",
-                directory, absolute) ;
-            info = GrB_INVALID_VALUE ;
-            goto cleanup ;
-        }
-        inverse_labels[a] = label < 0 ;
-        snprintf (path, path_size, "%s/%" PRId64 ".txt", directory, label) ;
-        info = read_graph (&R[a], path, msg) ;
+        if (!strcmp (files[3 + a], "-")) continue ;
+        info = read_graph (&R[a], files[3 + a], msg) ;
         if (info != GrB_SUCCESS) goto cleanup ;
     }
-    fclose (meta) ;
-    meta = NULL ;
-
-    ns = source != 0 ? 1 : (size_t) ng ;
-    info = LAGraph_Malloc ((void **) &S, ns, sizeof (GrB_Index), msg) ;
-    if (info != GrB_SUCCESS) goto cleanup ;
-    if (source != 0) S[0] = source - 1 ;
-    else for (size_t k = 0 ; k < ns ; k++) S[k] = k ;
 
     double begin = LAGraph_WallClockTime ( ) ;
     info = query (&paths, &path_count, R, inverse_labels, nl,
@@ -195,29 +189,26 @@ static int run_query
     double seconds = LAGraph_WallClockTime ( ) - begin ;
     if (info != GrB_SUCCESS) goto cleanup ;
 
-    const char *number = strrchr (directory, '/') ;
-    printf ("%s\t%.9f\t%zu\n", number == NULL ? directory : number + 1,
-        seconds, path_count) ;
+    printf ("%s\t%.9f\t%zu\n", files[0], seconds, path_count) ;
     fflush (stdout) ;
 cleanup:
     if (meta != NULL) fclose (meta) ;
     if (R != NULL)
         for (size_t a = 0 ; a < nl ; a++) LAGraph_Delete (&R[a], NULL) ;
     LAGraph_2RpqPath_FreePaths (&paths, path_count, NULL) ;
-    LAGraph_Free ((void **) &path, NULL) ;
     LAGraph_Free ((void **) &QS, NULL) ;
     LAGraph_Free ((void **) &QF, NULL) ;
     LAGraph_Free ((void **) &S, NULL) ;
-    LAGraph_Free ((void **) &G, NULL) ;
     LAGraph_Free ((void **) &R, NULL) ;
     LAGraph_Free ((void **) &inverse_labels, NULL) ;
     return (info) ;
 }
 
-// The Python launcher supplies: semantics graph_count graph_files... query_dirs...
+// The Python launcher supplies: semantics nl graph_files... followed by query
+// blocks: number meta_file sources_file nfa_files... (nl entries, "-" if absent).
 int main (int argc, char **argv)
 {
-    if (argc < 5) return (EXIT_FAILURE) ;
+    if (argc < 8) return (EXIT_FAILURE) ;
     QueryFunction query = NULL ;
     if (!strcmp (argv[1], "all")) query = LAGraph_2RpqPath_AllPaths ;
     if (!strcmp (argv[1], "simple")) query = LAGraph_2RpqPath_AllSimple ;
@@ -225,10 +216,11 @@ int main (int argc, char **argv)
     if (!strcmp (argv[1], "shortest")) query = LAGraph_2RpqPath_AllShortestPaths ;
     char *end = NULL ;
     long n = strtol (argv[2], &end, 10) ;
-    if (query == NULL || *end != '\0' || n < 1 || n > argc - 4)
+    if (query == NULL || *end != '\0' || n < 1 || n > (argc - 6) / 2 ||
+        (argc - 3 - n) % (n + 3) != 0)
         return (EXIT_FAILURE) ;
     char msg [LAGRAPH_MSG_LEN] = "" ;
-    GraphLabel *graph = NULL ;
+    LAGraph_Graph *G = NULL ;
     bool failed = false ;
     int info = LAGraph_Init (msg) ;
     if (info != GrB_SUCCESS)
@@ -236,24 +228,15 @@ int main (int argc, char **argv)
         fprintf (stderr, "initialization: info=%d %s\n", info, msg) ;
         return (EXIT_FAILURE) ;
     }
-    info = LAGraph_Calloc ((void **) &graph, (size_t) n, sizeof (GraphLabel), msg) ;
+    info = LAGraph_Calloc ((void **) &G, (size_t) n, sizeof (LAGraph_Graph), msg) ;
     if (info != GrB_SUCCESS) goto cleanup ;
     GrB_Index ng = 0 ;
     for (long k = 0 ; k < n ; k++)
     {
-        const char *file = argv[3 + k] ;
-        const char *base = strrchr (file, '/') ;
-        base = base == NULL ? file : base + 1 ;
-        graph[k].label = strtoll (base, &end, 10) ;
-        if (graph[k].label < 1 || *end != '.')
-        {
-            info = GrB_INVALID_VALUE ;
-            goto cleanup ;
-        }
-        info = read_graph (&graph[k].graph, file, msg) ;
+        info = read_graph (&G[k], argv[3 + k], msg) ;
         if (info != GrB_SUCCESS) goto cleanup ;
         GrB_Index size = 0 ;
-        info = GrB_Matrix_nrows (&size, graph[k].graph->A) ;
+        info = GrB_Matrix_nrows (&size, G[k]->A) ;
         if (info != GrB_SUCCESS) goto cleanup ;
         if (k != 0 && size != ng)
         {
@@ -264,9 +247,10 @@ int main (int argc, char **argv)
         ng = size ;
     }
     printf ("query\ttime_seconds\tpaths\n") ;
-    for (int k = 3 + (int) n ; k < argc ; k++)
+    for (int k = 3 + (int) n ; k < argc ; k += (int) n + 3)
     {
-        int query_info = run_query (argv[k], graph, (size_t) n, ng, query, msg) ;
+        msg[0] = '\0' ;
+        int query_info = run_query (argv + k, G, (size_t) n, query, msg) ;
         if (query_info != GrB_SUCCESS)
         {
             fprintf (stderr, "%s: info=%d %s\n", argv[k], query_info, msg) ;
@@ -274,9 +258,9 @@ int main (int argc, char **argv)
         }
     }
 cleanup:
-    if (graph != NULL)
-        for (long k = 0 ; k < n ; k++) LAGraph_Delete (&graph[k].graph, NULL) ;
-    LAGraph_Free ((void **) &graph, NULL) ;
+    if (G != NULL)
+        for (long k = 0 ; k < n ; k++) LAGraph_Delete (&G[k], NULL) ;
+    LAGraph_Free ((void **) &G, NULL) ;
     if (info != GrB_SUCCESS) fprintf (stderr, "info=%d %s\n", info, msg) ;
     LAGraph_Finalize (NULL) ;
     return (failed || info != GrB_SUCCESS ? EXIT_FAILURE : EXIT_SUCCESS) ;

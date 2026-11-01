@@ -7,63 +7,76 @@ cmake -S . -B build
 cmake --build build --target rpq_paths_demo -j4
 ```
 
-Run from the repository root, passing the queries directory and graph
-decomposition files directly:
+Pass a queries directory and the graph decomposition files:
 
 ```bash
 python3 experimental/benchmark/rpq_paths_bench.py \
-  /path/to/queries \
-  /path/to/graph/1.txt /path/to/graph/2.txt \
+  /path/to/queries /path/to/graph/a.mtx /path/to/graph/b.mtx \
   --semantics trails --build-dir build
 ```
 
-Graph filenames identify positive label numbers: `1.txt`, `0002.mat`, `3.mtx`.
-Their contents must be square Matrix Market matrices with equal dimensions.
-Numeric values are cast to Boolean adjacency values. Pass every graph label
-used by the queries; no decomposition or regex conversion is performed.
-
-`--semantics` accepts `all` (default), `simple`, `trails`, or `shortest`.
-The existing algorithm's reconstruction depth and arena limits apply.
-
-Queries use the `la-rpq/Scripts/sparql-to-fa` / `pokec-queries-to-fa` layout:
+The input format matches `data/rpq_data` and the loader in
+`experimental/test/test_2Rpq.c`:
 
 ```text
 queries/
-  1/
-    meta.txt
-    1.txt
-    -2.txt
-  2/
-    meta.txt
-    ...
+  1_meta.txt
+  1_sources.txt
+  1_a.mtx
+  2_meta.txt
+  2_sources.txt
+  2_a.mtx
+  2_b.mtx
 ```
 
-For example, `meta.txt` can contain:
+`<number>_meta.txt` contains two counted lists: initial and final NFA states.
+For example, one initial state (1) and two final states (2 and 3):
 
 ```text
-12 0
 1 1
-1 3
-2 1 -2
+2 2 3
 ```
 
-The first line gives source and target vertices; `0` means unrestricted.
-The benchmark supports a fixed source or all sources (`0`), with an unrestricted
-target (`0`). A nonzero target is rejected with an error because the public API
-has no target parameter.
-The next two lists contain the count and one-based initial/final NFA states.
-The last list contains the count and signed label IDs: `-2` uses graph matrix
-`2.txt` backwards and NFA matrix `-2.txt`. Vertex and state IDs are one-based
-in metadata and are converted to the algorithm's zero-based indices.
-`raw.txt` is ignored. Numbered query directories are processed in numeric order.
+`<number>_sources.txt` contains whitespace-separated graph source vertices,
+without a count. An empty file means an empty source set. Vertex and state IDs
+are one-based in these files and converted to zero-based API indices.
 
-The graph is loaded once. Each NFA is loaded before timing. One wall-clock
-measurement surrounds the complete public algorithm call, including predecessor
-matrix construction and path reconstruction. Loading matrices and freeing paths
-are outside the measured interval. The reported count is the `path_count`
-returned by the selected public function, without additional result processing.
-The driver passes `inverse = false`; signed labels still control the direction
-of individual labels through `inverse_labels`.
+`<number>_<label>.mtx` is the NFA adjacency matrix for that label. An absent file
+means an absent NFA label (`NULL` in the API). Supply a graph matrix for every
+label used by the queries. Graph matrix filenames define labels by their stems:
+`a.mtx` corresponds to `<number>_a.mtx`. For other filenames, specify the label
+explicitly, for example `a=/path/to/labels_a.mtx`.
+
+Graph and NFA files must contain square Matrix Market matrices. Graph matrices
+must share dimensions; NFA matrices must share dimensions within each query.
+Numeric values are cast to Boolean adjacency values. No decomposition or regex
+conversion is performed. Queries are processed in numeric order.
+
+The graph is loaded once. Each NFA and its sources are loaded before timing.
+One wall-clock measurement surrounds the complete public algorithm call,
+including predecessor matrix construction and path reconstruction. Loading
+inputs and freeing returned paths are outside the measured interval. The
+reported count is the returned `path_count`, without additional processing.
+`inverse` and all `inverse_labels` flags are false.
+
+`--semantics` accepts `all` (default), `simple`, `trails`, or `shortest`.
+The algorithm's reconstruction depth and arena limits apply.
+
+For the repository examples, queries 1–4 use `a.mtx` and `b.mtx`, while queries
+5–6 use a different graph (`labels_a.mtx` and `labels_b.mtx`). Put the desired
+query files in a separate directory for each graph. For example:
+
+```bash
+mkdir -p /tmp/rpq-queries-1-4
+cp data/rpq_data/[1-4]_*.mtx data/rpq_data/[1-4]_meta.txt \
+  data/rpq_data/[1-4]_sources.txt /tmp/rpq-queries-1-4/
+python3 experimental/benchmark/rpq_paths_bench.py \
+  /tmp/rpq-queries-1-4 data/rpq_data/a.mtx data/rpq_data/b.mtx \
+  --semantics trails --build-dir build
+```
+
+For queries 5–6, use graph arguments
+`a=data/rpq_data/labels_a.mtx b=data/rpq_data/labels_b.mtx`.
 
 Output is tab-separated, one successful query per row:
 
@@ -73,5 +86,6 @@ query   time_seconds   paths
 2       0.000456789    3
 ```
 
-Redirect stdout to save the table. Errors go to stderr, subsequent queries still
-run, and the script returns a nonzero exit status if any query failed.
+Redirect stdout to save the table. Input discovery errors stop the launcher.
+Driver errors go to stderr, subsequent queries still run, and the script returns
+a nonzero exit status if any query failed.
