@@ -14,9 +14,9 @@
 // There is no visited mask: alternative predecessors and cycles must survive
 // in P.  Path semantics are checked later, during backward reconstruction.
 //
-// Increments 1 through 4 prepare the first multiplication and a block pool.
+// Increments 1 through 5 implement both products and temporary predecessor sets.
 // All owned matrices are local variables in LG_RpqPath_Traverse.
-// The second multiplication, accumulation and reconstruction follow.
+// Accumulation into P and reconstruction follow in later increments.
 // The internal workspace is not yet a public path-result interface.
 // Optimizations, including minor ones, require the user's prior approval.
 
@@ -216,6 +216,8 @@ LG_RpqPath_BlockPool ;
 
 // GraphBLAS copies this handle by value, not the blocks it references.  A
 // published set must remain immutable: a copied UDT may still share its head.
+// Records are distinct and sorted lexicographically by (state, vertex, label)
+// across the whole chain, including block boundaries.
 typedef struct
 {
     LG_RpqPath_BlockPool *pool ;     // borrowed owner; alive for the traversal
@@ -291,8 +293,11 @@ static LG_RpqPath_PredecessorBlock *LG_RpqPath_PoolAcquire
  * @param[in,out] set Non-NULL unpublished set with an initialized pool pointer.
  *     head may be NULL.  Its chain must not be shared with other values or
  *     modified by another thread; only block-index reservation is atomic.
+ * @param[in,out] tail Address of the construction's local last-block pointer.
+ *     Start with NULL for an empty set; preserve it between append calls.
+ *     The pointer is updated only when a new block is successfully attached.
  * @param[in] record Non-NULL predecessor record, copied into the last block.
- *     The caller is responsible for excluding duplicates before appending.
+ *     The caller supplies records in strictly increasing lexicographic order.
  * @return true on success; false if no free block remains in the pool.
  *     Previously appended records stay valid on failure, and set->pool->error
  *     contains GrB_OUT_OF_MEMORY for the caller to inspect after GraphBLAS
@@ -302,34 +307,215 @@ static LG_RpqPath_PredecessorBlock *LG_RpqPath_PoolAcquire
 static bool LG_RpqPath_TemporaryAppend
 (
     LG_RpqPath_TemporarySet *set,
+    LG_RpqPath_PredecessorBlock **tail,
     const LG_RpqPath_Predecessor *record
 )
 {
-    LG_RpqPath_PredecessorBlock *block = set->head ;
-    if (block == NULL)
+    LG_RpqPath_PredecessorBlock *block = *tail ;
+    if (block == NULL || block->count == LG_RPQ_PATH_BLOCK_CAPACITY)
     {
-        block = LG_RpqPath_PoolAcquire (set->pool) ;
-        if (block == NULL) return (false) ;
-        set->head = block ;
-    }
-    else
-    {
-        while (block->next != NULL)
+        LG_RpqPath_PredecessorBlock *next =
+            LG_RpqPath_PoolAcquire (set->pool) ;
+        if (next == NULL) return (false) ;
+        if (block == NULL)
         {
-            block = block->next ;
+            set->head = next ;
         }
-        if (block->count == LG_RPQ_PATH_BLOCK_CAPACITY)
+        else
         {
-            LG_RpqPath_PredecessorBlock *next =
-                LG_RpqPath_PoolAcquire (set->pool) ;
-            if (next == NULL) return (false) ;
             block->next = next ;
-            block = next ;
         }
+        block = next ;
+        *tail = block ;
     }
     block->records[block->count] = *record ;
     block->count++ ;
     return (true) ;
+}
+
+/**
+ * @brief Compare predecessor records in the order used by temporary sets.
+ *
+ * @param[in] left Non-NULL first record.
+ * @param[in] right Non-NULL second record.
+ * @return -1, 0 or 1 when left is less than, equal to or greater than right
+ *     lexicographically by state, then vertex, then label.
+ */
+static int LG_RpqPath_ComparePredecessors
+(
+    const LG_RpqPath_Predecessor *left,
+    const LG_RpqPath_Predecessor *right
+)
+{
+    if (left->state < right->state) return (-1) ;
+    if (left->state > right->state) return (1) ;
+    if (left->vertex < right->vertex) return (-1) ;
+    if (left->vertex > right->vertex) return (1) ;
+    if (left->label < right->label) return (-1) ;
+    if (left->label > right->label) return (1) ;
+    return (0) ;
+}
+
+/**
+ * @brief Advance one input cursor across a temporary set's block chain.
+ *
+ * @param[in,out] block Address of the current non-NULL immutable block pointer.
+ *     Becomes the next block, or NULL at the end of the set, when exhausted.
+ * @param[in,out] index Index of a valid current record.  Incremented within
+ *     the block and reset to zero when advancing to the next block.
+ */
+static void LG_RpqPath_TemporaryAdvance
+(
+    const LG_RpqPath_PredecessorBlock **block,
+    size_t *index
+)
+{
+    (*index)++ ;
+    if (*index == (*block)->count)
+    {
+        *block = (*block)->next ;
+        *index = 0 ;
+    }
+}
+
+/**
+ * @brief Union two temporary predecessor sets without changing their blocks.
+ *
+ * @param[out] z GraphBLAS output buffer for TemporarySet.  May alias x or y;
+ *     input handles are captured before the result handle is overwritten.
+ * @param[in] x Immutable sorted first set, including the empty monoid identity.
+ * @param[in] y Immutable sorted second set belonging to the same pool as x.
+ *
+ * Two cursors merge records in O(|x| + |y|), including traversal across blocks.
+ * Equal records are emitted once and advance both cursors.  A local output
+ * tail allows appending without rescanning the result chain.
+ * Every output record is copied into a new private chain.  Shallow-copied UDT
+ * handles therefore never observe mutations of an input chain.  Exhaustion
+ * produces an empty handle and sets the pool error; the outer traversal must
+ * discard the failed operation's result after waiting for its completion.
+ */
+static void LG_RpqPath_UnionPredecessors (void *z, const void *x, const void *y)
+{
+    LG_RpqPath_TemporarySet left = *(const LG_RpqPath_TemporarySet *) x ;
+    LG_RpqPath_TemporarySet right = *(const LG_RpqPath_TemporarySet *) y ;
+    LG_RpqPath_TemporarySet result = { .pool = left.pool, .head = NULL } ;
+    LG_RpqPath_PredecessorBlock *tail = NULL ;
+    const LG_RpqPath_PredecessorBlock *left_block = left.head ;
+    const LG_RpqPath_PredecessorBlock *right_block = right.head ;
+    size_t left_index = 0, right_index = 0 ;
+
+    if (atomic_load (&result.pool->error) == GrB_SUCCESS)
+    {
+        while (left_block != NULL || right_block != NULL)
+        {
+            const LG_RpqPath_Predecessor *record ;
+            if (left_block == NULL)
+            {
+                record = &right_block->records[right_index] ;
+                LG_RpqPath_TemporaryAdvance (&right_block, &right_index) ;
+            }
+            else if (right_block == NULL)
+            {
+                record = &left_block->records[left_index] ;
+                LG_RpqPath_TemporaryAdvance (&left_block, &left_index) ;
+            }
+            else
+            {
+                const LG_RpqPath_Predecessor *left_record =
+                    &left_block->records[left_index] ;
+                const LG_RpqPath_Predecessor *right_record =
+                    &right_block->records[right_index] ;
+                int order = LG_RpqPath_ComparePredecessors (
+                    left_record, right_record) ;
+                record = (order <= 0) ? left_record : right_record ;
+                if (order <= 0)
+                {
+                    LG_RpqPath_TemporaryAdvance (&left_block, &left_index) ;
+                }
+                if (order >= 0)
+                {
+                    LG_RpqPath_TemporaryAdvance (&right_block, &right_index) ;
+                }
+            }
+            if (!LG_RpqPath_TemporaryAppend (&result, &tail, record))
+            {
+                // Partial output remains in the arena until iteration reset.
+                result.head = NULL ;
+                break ;
+            }
+        }
+    }
+    *(LG_RpqPath_TemporarySet *) z = result ;
+}
+
+// The scalar bound to the indexed product carries the current label and a
+// borrowed arena pointer.  Binding copies the scalar value, including this
+// pointer; the arena remains alive until all operators and matrices are freed.
+typedef struct
+{
+    LG_RpqPath_BlockPool *pool ;
+    size_t label ;
+}
+LG_RpqPath_PredecessorContext ;
+
+/**
+ * @brief Extend an H state set into predecessor records for a graph edge.
+ *
+ * @param[out] z GraphBLAS output buffer for a TemporarySet handle.
+ * @param[in] x StateSet value H[p,j], containing distinct predecessor states q.
+ * @param[in] ix Row p of H; unused because C's row already records this state.
+ * @param[in] jx Column j of H, the predecessor graph vertex to record.
+ * @param[in] y Boolean graph adjacency value in the chosen traversal direction.
+ * @param[in] iy Row of the graph operand; unused because jx identifies j.
+ * @param[in] jy Destination graph vertex; unused because C's column records it.
+ * @param[in] theta Bound PredecessorContext containing the pool and label a.
+ *
+ * Produces {(q,jx,a) | q belongs to x} when y is true; otherwise the empty
+ * set.  H already contains increasing q; jx and a are fixed for this call,
+ * so the emitted records are sorted without a separate sorting pass.
+ * Newly acquired blocks are private until the result handle is written.
+ * A failed allocation records GrB_OUT_OF_MEMORY in the pool and returns an
+ * empty handle; the caller checks the flag after GrB_Matrix_wait on C.
+ */
+static void LG_RpqPath_CollectPredecessors
+(
+    void *z,
+    const void *x,
+    GrB_Index ix,
+    GrB_Index jx,
+    const void *y,
+    GrB_Index iy,
+    GrB_Index jy,
+    const void *theta
+)
+{
+    (void) ix ;
+    (void) iy ;
+    (void) jy ;
+    const LG_RpqPath_StateSet *states = x ;
+    const LG_RpqPath_PredecessorContext *context = theta ;
+    LG_RpqPath_TemporarySet result = { .pool = context->pool, .head = NULL } ;
+    LG_RpqPath_PredecessorBlock *tail = NULL ;
+
+    if (*(const bool *) y &&
+        atomic_load (&context->pool->error) == GrB_SUCCESS)
+    {
+        for (size_t k = 0 ; k < states->count ; k++)
+        {
+            LG_RpqPath_Predecessor record =
+            {
+                .state = states->states[k],
+                .vertex = jx,
+                .label = context->label
+            } ;
+            if (!LG_RpqPath_TemporaryAppend (&result, &tail, &record))
+            {
+                result.head = NULL ;
+                break ;
+            }
+        }
+    }
+    *(LG_RpqPath_TemporarySet *) z = result ;
 }
 
 /**
@@ -720,13 +906,12 @@ int LG_RpqPath_Init
  *     may be NULL.  Cleared on entry.
  *
  * @return GrB_SUCCESS if no product-graph step is needed, GrB_NOT_IMPLEMENTED
- *     after the first multiplication when the second product is required,
- *     or an error from a GraphBLAS operation.
- * @note This increment implements H = N^T x frontier (or N x frontier for
- *     inverse queries).  The second product, accumulation and reconstruction
- *     are still missing.  No paths are returned yet.  All owned matrices and
- *     operators and pool blocks are released before returning.  The pool is
- *     ready for the next increment but the second product does not use it yet.
+ *     when C needs accumulation into P, GrB_OUT_OF_MEMORY if the pool is
+ *     exhausted, or an error from a GraphBLAS operation.
+ * @note Both products are implemented, including reversed traversal.  The
+ *     accumulation and reconstruction are still missing; no paths are returned
+ *     yet.  All owned matrices, operators and pool blocks are released before
+ *     returning.
  */
 int LG_RpqPath_Traverse
 (
@@ -740,6 +925,7 @@ int LG_RpqPath_Traverse
 {
     LG_CLEAR_MSG ;
     int info = GrB_SUCCESS ;
+    bool pool_exhausted = false ;   // preserve exhaustion across arena reset
 
     // These matrices outlive a single iteration, but belong to this call.
     // P accumulates predecessors; roots remains immutable for reconstruction.
@@ -758,6 +944,13 @@ int LG_RpqPath_Traverse
     GrB_Semiring state_semiring = NULL ;
     GrB_Scalar state_capacity = NULL ;
     LG_RpqPath_StateSet *empty_state_set = NULL ;
+
+    // The second product reduces with predecessor-set union and binds a pool
+    // pointer and label to its indexed multiplier separately for each label.
+    GrB_BinaryOp predecessor_union = NULL ;
+    GrB_Monoid predecessor_union_monoid = NULL ;
+    GxB_IndexBinaryOp collect_predecessors = NULL ;
+    GrB_Type predecessor_context_type = NULL ;
 
     // All temporary C values in this traversal will borrow this local pool.
     // Its backing array survives iterations; the reservation index is reset.
@@ -805,6 +998,24 @@ int LG_RpqPath_Traverse
         state_multiply) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
 
+    info = GrB_BinaryOp_new (&predecessor_union, LG_RpqPath_UnionPredecessors,
+        work->temporary_set_type, work->temporary_set_type,
+        work->temporary_set_type) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    LG_RpqPath_TemporarySet empty_predecessor_set =
+        { .pool = &pool, .head = NULL } ;
+    info = GrB_Monoid_new_UDT (&predecessor_union_monoid, predecessor_union,
+        &empty_predecessor_set) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    info = GrB_Type_new (&predecessor_context_type,
+        sizeof (LG_RpqPath_PredecessorContext)) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    info = GxB_IndexBinaryOp_new (&collect_predecessors,
+        LG_RpqPath_CollectPredecessors, work->temporary_set_type,
+        work->state_set_type, GrB_BOOL, predecessor_context_type,
+        "LG_RpqPath_CollectPredecessors", NULL) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+
     info = GrB_Matrix_new (&P, work->stored_set_type, work->nr, work->ng) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
     info = GrB_Matrix_new (&roots, GrB_BOOL, work->nr, work->ng) ;
@@ -826,6 +1037,14 @@ int LG_RpqPath_Traverse
         GrB_Matrix H = NULL ;
         GrB_Matrix C = NULL ;
         GrB_Matrix next_frontier = NULL ;
+        bool have_products = false ;
+
+        // A bound index operator copies its scalar, so the multiplier and its
+        // semiring must be recreated when the label changes.  Keep their
+        // handles in this scope to clean partial construction on error too.
+        GrB_Scalar predecessor_context = NULL ;
+        GrB_BinaryOp predecessor_multiply = NULL ;
+        GrB_Semiring predecessor_semiring = NULL ;
 
         info = GrB_Matrix_new (&H, work->state_set_type, work->nr, work->ng) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
@@ -850,14 +1069,48 @@ int LG_RpqPath_Traverse
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
             // No wait between the products: GraphBLAS manages the dependency
             // when the second multiplication consumes H as an input matrix.
-            // TODO: C += H x G_a, including the label in every predecessor.
-            // Wait for C after that product and inspect pool.error.  Reset the
-            // pool only at iteration end, after all uses of its blocks finish.
-            // The block pool is ready; the second product is the next increment.
-            info = GrB_NOT_IMPLEMENTED ;
-            break ;
+            LG_RpqPath_PredecessorContext context =
+                { .pool = &pool, .label = a } ;
+            info = GrB_Scalar_new (&predecessor_context,
+                predecessor_context_type) ;
+            if (info != GrB_SUCCESS) goto iteration_cleanup ;
+            info = GrB_Scalar_setElement_UDT (predecessor_context, &context) ;
+            if (info != GrB_SUCCESS) goto iteration_cleanup ;
+            info = GxB_BinaryOp_new_IndexOp (&predecessor_multiply,
+                collect_predecessors, predecessor_context) ;
+            if (info != GrB_SUCCESS) goto iteration_cleanup ;
+            info = GrB_Semiring_new (&predecessor_semiring,
+                predecessor_union_monoid, predecessor_multiply) ;
+            if (info != GrB_SUCCESS) goto iteration_cleanup ;
+
+            // Accumulate all labels into C without replacing previous values.
+            // The indexed product records j from H[p,j], which is unchanged
+            // when the graph operand is transposed for an inverse label.
+            GrB_Descriptor graph_direction = work->reverse_graph[a] ?
+                GrB_DESC_T1 : NULL ;
+            info = GrB_mxm (C, NULL, predecessor_union, predecessor_semiring,
+                H, work->A[a], graph_direction) ;
+            if (info != GrB_SUCCESS) goto iteration_cleanup ;
+            info = GrB_Matrix_wait (C, GrB_MATERIALIZE) ;
+            if (info != GrB_SUCCESS) goto iteration_cleanup ;
+            info = atomic_load (&pool.error) ;
+            if (info != GrB_SUCCESS) goto iteration_cleanup ;
+
+            // C is materialized and no longer needs these label-bound objects.
+            // The arena itself remains live until the whole iteration ends.
+            GrB_free (&predecessor_semiring) ;
+            GrB_free (&predecessor_multiply) ;
+            GrB_free (&predecessor_context) ;
+            have_products = true ;
         }
-        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+
+        // Do not pretend that a populated C has been saved or that the next
+        // frontier has been computed: those are the next approved increment.
+        if (have_products)
+        {
+            info = GrB_NOT_IMPLEMENTED ;
+            goto iteration_cleanup ;
+        }
 
         // TODO: Compare C with the OLD P using a Boolean GxB_eWiseUnion
         // predicate for new records; remove stored false values to obtain the
@@ -872,13 +1125,25 @@ int LG_RpqPath_Traverse
         next_frontier = NULL ;
 
 iteration_cleanup:
+        // On error, finish any pending C computation before invalidating its
+        // block handles.  Preserve the original error if cleanup also fails.
+        if (C != NULL)
+        {
+            int cleanup_info = GrB_Matrix_wait (C, GrB_MATERIALIZE) ;
+            if (info == GrB_SUCCESS) info = cleanup_info ;
+        }
+        int pool_info = atomic_load (&pool.error) ;
+        if (pool_info == GrB_OUT_OF_MEMORY) pool_exhausted = true ;
+        if (info == GrB_SUCCESS) info = pool_info ;
         // H owns its state sets inline; freeing H releases their storage too.
-        // C still has no values.  The second-product increment must wait for
-        // callbacks and check pool.error before entering cleanup.  Once P is
-        // populated, its independent copies must be finished before this point.
+        // C only holds arena handles, so free C before resetting that arena.
+        // Once P is populated, its deep copies must finish before this point.
         GrB_free (&H) ;
         GrB_free (&C) ;
         GrB_free (&next_frontier) ;
+        GrB_free (&predecessor_semiring) ;
+        GrB_free (&predecessor_multiply) ;
+        GrB_free (&predecessor_context) ;
         LG_RpqPath_PoolReset (&pool) ;
         if (info != GrB_SUCCESS) goto traversal_cleanup ;
     }
@@ -891,6 +1156,10 @@ traversal_cleanup:
     // as well: GrB_free alone does not free pointers stored inside UDT values.
     GrB_free (&P) ;
     // Matrices have been released; their operators can now be released too.
+    GrB_free (&collect_predecessors) ;
+    GrB_free (&predecessor_union_monoid) ;
+    GrB_free (&predecessor_union) ;
+    GrB_free (&predecessor_context_type) ;
     GrB_free (&state_semiring) ;
     GrB_free (&state_multiply) ;
     GrB_free (&collect_state) ;
@@ -901,7 +1170,11 @@ traversal_cleanup:
     LG_RpqPath_PoolDestroy (&pool) ;
     if (info == GrB_NOT_IMPLEMENTED)
     {
-        LG_ERROR_MSG ("second RPQ multiplication is not implemented yet") ;
+        LG_ERROR_MSG ("RPQ predecessor accumulation is not implemented yet") ;
+    }
+    else if (info == GrB_OUT_OF_MEMORY && pool_exhausted)
+    {
+        LG_ERROR_MSG ("RPQ predecessor block pool is exhausted") ;
     }
     else if (info != GrB_SUCCESS)
     {
