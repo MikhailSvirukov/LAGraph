@@ -14,8 +14,11 @@
 // There is no visited mask: alternative predecessors and cycles must survive
 // in P.  Path semantics are checked later, during backward reconstruction.
 //
-// Increment 1 implements only preparation, ending before the traversal loop.
+// Increments 1 and 2 prepare metadata, value types and a traversal skeleton.
+// All owned matrices are local variables in LG_RpqPath_Traverse.
+// No multiplication, predecessor allocation or reconstruction runs yet.
 // The internal workspace is not yet a public path-result interface.
+// Optimizations, including minor ones, require the user's prior approval.
 
 // The input helpers own no memory; workspace cleanup is enabled before Init.
 #define LG_FREE_WORK ;
@@ -37,6 +40,45 @@
 #define LG_RPQ_PATH_MAX_LENGTH 1024
 #endif
 
+// One incoming product-graph edge.  Its destination is given by the P/C cell
+// indices; these fields identify the predecessor configuration and edge label.
+typedef struct
+{
+    GrB_Index state ;               // predecessor NFA state q
+    GrB_Index vertex ;              // predecessor graph vertex j
+    size_t label ;                  // traversed label a
+}
+LG_RpqPath_Predecessor ;
+
+// H values reserve room for all nr state indices.  The GraphBLAS type size is
+// fixed for one query: sizeof this header plus nr * sizeof (GrB_Index).
+// Only the first count entries belong to the set; count == 0 means empty.
+typedef struct
+{
+    size_t count ;
+    GrB_Index states [] ;
+}
+LG_RpqPath_StateSet ;
+
+// Block layout and allocation are introduced in the allocator increment.
+// GraphBLAS copies this handle by value, not the blocks it will reference.
+typedef struct LG_RpqPath_PredecessorBlock LG_RpqPath_PredecessorBlock ;
+
+typedef struct
+{
+    LG_RpqPath_PredecessorBlock *head ;  // NULL denotes an empty temporary set
+}
+LG_RpqPath_TemporarySet ;
+
+// P owns its records independently of the temporary blocks used by C.
+// Appending records and deep copying their contents are implemented later.
+typedef struct
+{
+    size_t count ;
+    LG_RpqPath_Predecessor *records ;    // malloc/realloc storage; NULL if empty
+}
+LG_RpqPath_StoredSet ;
+
 typedef struct
 {
     GrB_Index ng ;                   // number of graph vertices
@@ -51,11 +93,11 @@ typedef struct
     GrB_Matrix *N ;                  // original NFA decomposition
     bool *reverse_graph ;           // inverse XOR inverse_labels[label]
 
-    GrB_Matrix frontier ;           // M: active (state, vertex) configurations
-    GrB_Matrix roots ;              // immutable initial QS x S relation
-    GrB_Index frontier_nvals ;      // actual initial frontier size
+    GrB_Type state_set_type ;        // H value: header and room for nr states
+    GrB_Type temporary_set_type ;    // C value: handle to temporary blocks
+    GrB_Type stored_set_type ;       // P value: owned array of predecessors
 
-    // P and the per-iteration H/C matrices are introduced in the next increment.
+    // Traversal matrices are local to Traverse, never stored in this context.
 }
 LG_RpqPath_Workspace ;
 
@@ -68,13 +110,16 @@ LG_RpqPath_Workspace ;
  *
  * The A/N arrays are freed, but their elements are borrowed input matrices
  * and are never freed here.
+ * This context owns no traversal matrices.  Traverse releases them locally
+ * before the value types owned by this context can be destroyed.
  */
 static void LG_RpqPath_Free (LG_RpqPath_Workspace **workspace)
 {
     if (workspace == NULL || *workspace == NULL) return ;
     LG_RpqPath_Workspace *work = *workspace ;
-    GrB_free (&work->frontier) ;
-    GrB_free (&work->roots) ;
+    GrB_free (&work->state_set_type) ;
+    GrB_free (&work->temporary_set_type) ;
+    GrB_free (&work->stored_set_type) ;
     LAGraph_Free ((void **) &work->A, NULL) ;
     LAGraph_Free ((void **) &work->N, NULL) ;
     LAGraph_Free ((void **) &work->reverse_graph, NULL) ;
@@ -261,29 +306,30 @@ static int LG_RpqPath_PrepareDecomposition
  *     graph traversal for that label, before whole-query inversion is applied.
  * @param[in] nl Positive number of label slots in R, G and inverse_labels.
  * @param[in] QS Array of nqs initial NFA state indices; NULL allowed if nqs=0.
- * @param[in] nqs Number of entries in QS; duplicates collapse in the frontier.
+ * @param[in] nqs Number of entries in QS; duplicates are allowed.
  * @param[in] QF Array of nqf accepting NFA state indices; NULL allowed if nqf=0.
  *     This increment only validates these indices; QF is not retained.
  * @param[in] nqf Number of entries in QF; duplicates are allowed.
  * @param[in] G Graph decomposition: nl graph handles indexed by label.
  *     Individual entries may be NULL; at least one adjacency matrix must exist.
  * @param[in] S Array of ns source vertex indices; NULL allowed if ns=0.
- * @param[in] ns Number of entries in S; duplicates collapse in the frontier.
+ * @param[in] ns Number of entries in S; duplicates are allowed.
  * @param[in] inverse Reverse the whole query: traverse the NFA backwards and
  *     flip every label's graph direction (inverse XOR inverse_labels[a]).
  *     QS and QF are used as supplied; this function does not swap them.
  * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes;
  *     may be NULL.  Cleared on entry.
  *
- * All indices are zero-based.  The initial frontier and immutable roots are
- * the Cartesian product QS x S.  Empty source/start/final sets are valid.
+ * All indices are zero-based.  Empty source/start/final sets are valid.
  * Input matrices are borrowed and must remain alive while the workspace is
- * used.  Input arrays are read during initialization; their contents are
- * copied into workspace arrays or GraphBLAS objects as needed.
+ * used.  Matrix handles and direction flags are copied into workspace arrays.
+ * QS, QF and S are validated but not retained.  Supply QS and S to Traverse
+ * again when creating the local initial frontier.
  *
  * @return GrB_SUCCESS on success, otherwise a LAGraph/GraphBLAS error code;
  *     any partially allocated workspace is released before returning an error.
- * @note This increment stops before P/H/C allocation and the main traversal.
+ * @note This function prepares metadata and value types only.  Traverse owns
+ *     P, roots and the frontier locally, with H/C created inside its loop.
  *     With LG_RPQ_PATH_VALIDATE_INPUT=0, the caller guarantees valid inputs.
  */
 int LG_RpqPath_Init
@@ -311,9 +357,13 @@ int LG_RpqPath_Init
     LG_TRY (LG_RpqPath_ValidateInput (workspace, R, inverse_labels, nl,
         QS, nqs, QF, nqf, G, S, ns, msg)) ;
 #else
-    // Accepting states will be consumed at the path-reconstruction stage.
+    // These sets are only validated here; Traverse receives QS and S directly.
+    (void) QS ;
+    (void) nqs ;
     (void) QF ;
     (void) nqf ;
+    (void) S ;
+    (void) ns ;
 #endif
 
     LG_TRY (LAGraph_Calloc ((void **) &work, 1,
@@ -342,21 +392,143 @@ int LG_RpqPath_Init
         work->reverse_graph[a] = (inverse != inverse_labels[a]) ;
     }
 
-    // Seed precisely the Cartesian product QS x S.  Duplicates in either input
-    // set collapse naturally.  Keep a separate copy of this relation: reaching
-    // a root during reconstruction emits a path (possibly of length zero), but
-    // must not discard additional paths through predecessors of that root.
-    GRB_TRY (GrB_Matrix_new (&work->roots, GrB_BOOL, work->nr, work->ng)) ;
-    if (nqs > 0 && ns > 0)
-    {
-        GRB_TRY (GrB_Matrix_assign_BOOL (work->roots, NULL, NULL, true,
-            QS, nqs, S, ns, NULL)) ;
-    }
-    GRB_TRY (GrB_Matrix_dup (&work->frontier, work->roots)) ;
-    GRB_TRY (GrB_Matrix_nvals (&work->frontier_nvals, work->frontier)) ;
+    // H has variable-size values across queries, but one fixed value size
+    // within a query.  Reserve all nr state slots in every value.  Check the
+    // allocation-size arithmetic even when optional input validation is off.
+    LG_ASSERT_MSG (work->nr <=
+        (SIZE_MAX - sizeof (LG_RpqPath_StateSet)) / sizeof (GrB_Index),
+        GrB_OUT_OF_MEMORY, "state set size exceeds addressable memory") ;
+    size_t state_set_size = sizeof (LG_RpqPath_StateSet) +
+        (size_t) work->nr * sizeof (GrB_Index) ;
+    GRB_TRY (GrB_Type_new (&work->state_set_type, state_set_size)) ;
+    GRB_TRY (GrB_Type_new (&work->temporary_set_type,
+        sizeof (LG_RpqPath_TemporarySet))) ;
+    GRB_TRY (GrB_Type_new (&work->stored_set_type,
+        sizeof (LG_RpqPath_StoredSet))) ;
 
-    // End of increment 1.  The main loop and P/H/C allocation follow in the
-    // next increments.  No multiplication or path reconstruction runs yet.
     *workspace = work ;
     return (GrB_SUCCESS) ;
+}
+
+/**
+ * @brief Set up local traversal matrices and the per-iteration lifecycle.
+ *
+ * @param[in] work Initialized metadata and value types from LG_RpqPath_Init.
+ *     Borrowed for this call; the caller retains ownership of the context.
+ * @param[in] QS Array of nqs initial NFA states, already validated by Init.
+ *     NULL is allowed when nqs is zero; duplicates collapse in roots.
+ * @param[in] nqs Number of entries in QS.
+ * @param[in] S Array of ns source vertices, already validated by Init.
+ *     NULL is allowed when ns is zero; duplicates collapse in roots.
+ * @param[in] ns Number of entries in S.
+ * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes;
+ *     may be NULL.  Cleared on entry.
+ *
+ * @return GrB_SUCCESS if no product-graph step is needed, GrB_NOT_IMPLEMENTED
+ *     when a matching label requires the not-yet-written multiplications,
+ *     or an error from a GraphBLAS operation.
+ * @note This is the increment-2 skeleton, not a path-result API.  No paths are
+ *     returned yet.  Multiplication, accumulation and reconstruction are added
+ *     in later increments.  All owned matrices are released before returning.
+ */
+int LG_RpqPath_Traverse
+(
+    LG_RpqPath_Workspace *work,
+    const GrB_Index *QS,
+    size_t nqs,
+    const GrB_Index *S,
+    size_t ns,
+    char *msg
+)
+{
+    LG_CLEAR_MSG ;
+    int info = GrB_SUCCESS ;
+
+    // These matrices outlive a single iteration, but belong to this call.
+    // P accumulates predecessors; roots remains immutable for reconstruction.
+    // frontier changes ownership when the next frontier replaces it below.
+    GrB_Matrix P = NULL ;
+    GrB_Matrix roots = NULL ;
+    GrB_Matrix frontier = NULL ;
+    GrB_Index frontier_nvals = 0 ;
+
+    info = GrB_Matrix_new (&P, work->stored_set_type, work->nr, work->ng) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    info = GrB_Matrix_new (&roots, GrB_BOOL, work->nr, work->ng) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    if (nqs > 0 && ns > 0)
+    {
+        info = GrB_Matrix_assign_BOOL (roots, NULL, NULL, true,
+            QS, nqs, S, ns, NULL) ;
+        if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    }
+    info = GrB_Matrix_dup (&frontier, roots) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    info = GrB_Matrix_nvals (&frontier_nvals, frontier) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+
+    while (frontier_nvals != 0)
+    {
+        // Created afresh for this iteration; no workspace aliases exist.
+        GrB_Matrix H = NULL ;
+        GrB_Matrix C = NULL ;
+        GrB_Matrix next_frontier = NULL ;
+
+        info = GrB_Matrix_new (&H, work->state_set_type, work->nr, work->ng) ;
+        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+        info = GrB_Matrix_new (&C, work->temporary_set_type,
+            work->nr, work->ng) ;
+        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+        info = GrB_Matrix_new (&next_frontier, GrB_BOOL, work->nr, work->ng) ;
+        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+
+        // Every label uses the same input frontier for this iteration.
+        for (size_t a = 0 ; a < work->nl ; a++)
+        {
+            if (work->A[a] == NULL || work->N[a] == NULL) continue ;
+
+            // TODO: H = N_a^T x frontier, then C += H x G_a, with the
+            // appropriate transpose descriptors for reversed traversal.
+            // Until those increments exist, report incomplete work explicitly.
+            info = GrB_NOT_IMPLEMENTED ;
+            break ;
+        }
+        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+
+        // TODO: Deep copy new C records into P.  Set next_frontier[p,i] only
+        // if this union adds at least one previously absent predecessor.
+        info = GrB_Matrix_nvals (&frontier_nvals, next_frontier) ;
+        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+
+        // Release the old frontier, transfer the new handle, and clear its
+        // former owner so iteration cleanup cannot free the next input.
+        GrB_free (&frontier) ;
+        frontier = next_frontier ;
+        next_frontier = NULL ;
+
+iteration_cleanup:
+        // These matrices hold no sets yet.  When temporary blocks are added,
+        // complete operations, copy into P and return the blocks here too.
+        GrB_free (&H) ;
+        GrB_free (&C) ;
+        GrB_free (&next_frontier) ;
+        if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    }
+
+    // TODO: Reconstruct paths from local P and roots before releasing them.
+traversal_cleanup:
+    GrB_free (&frontier) ;
+    GrB_free (&roots) ;
+    // P is still empty.  Once populated, release its owned record arrays here
+    // as well: GrB_free alone does not free pointers stored inside UDT values.
+    GrB_free (&P) ;
+    if (info == GrB_NOT_IMPLEMENTED)
+    {
+        LG_ERROR_MSG ("RPQ traversal multiplications are not implemented yet") ;
+    }
+    else if (info != GrB_SUCCESS)
+    {
+        LG_ERROR_MSG ("GraphBLAS failure during RPQ traversal: info: %d", info) ;
+    }
+    return (info) ;
 }
