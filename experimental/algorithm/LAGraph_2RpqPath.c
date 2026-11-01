@@ -1809,6 +1809,264 @@ int LG_RpqPath_Init
     return (GrB_SUCCESS) ;
 }
 
+// Traversal-local GraphBLAS handles only.  Matrix values and iteration-owned
+// bindings remain local variables in Traverse; this bundle owns no matrices.
+typedef struct
+{
+    GrB_BinaryOp state_union ;
+    GrB_Monoid state_union_monoid ;
+    GxB_IndexBinaryOp collect_state ;
+    GrB_BinaryOp state_multiply ;
+    GrB_Semiring state_semiring ;
+    GrB_Scalar state_capacity ;
+    GrB_BinaryOp predecessor_union ;
+    GrB_Monoid predecessor_union_monoid ;
+    GxB_IndexBinaryOp collect_predecessors ;
+    GrB_Type predecessor_context_type ;
+    GrB_Descriptor predecessor_product ;
+    GrB_BinaryOp has_new_predecessors ;
+    GrB_Scalar empty_temporary ;
+    GrB_Scalar empty_stored ;
+    GxB_IndexBinaryOp merge_predecessors ;
+    GrB_Type stored_context_type ;
+}
+LG_RpqPath_Operators ;
+
+/**
+ * @brief Free a complete or partially initialized traversal operator bundle.
+ * @param[in,out] ops Non-NULL bundle initially zero-initialized before creation.
+ *     Owned handles are freed and cleared; repeat calls are safe.
+ * @pre All operations using these handles have completed, and their per-label
+ *     and per-iteration bindings have been freed.  Materialized P may survive.
+ */
+static void LG_RpqPath_FreeOperators (LG_RpqPath_Operators *ops)
+{
+    // Queued operations and temporary bindings no longer use these handles.
+    GrB_free (&ops->has_new_predecessors) ;
+    GrB_free (&ops->merge_predecessors) ;
+    GrB_free (&ops->stored_context_type) ;
+    GrB_free (&ops->empty_temporary) ;
+    GrB_free (&ops->empty_stored) ;
+    GrB_free (&ops->predecessor_product) ;
+    GrB_free (&ops->collect_predecessors) ;
+    GrB_free (&ops->predecessor_union_monoid) ;
+    GrB_free (&ops->predecessor_union) ;
+    GrB_free (&ops->predecessor_context_type) ;
+    GrB_free (&ops->state_semiring) ;
+    GrB_free (&ops->state_multiply) ;
+    GrB_free (&ops->collect_state) ;
+    GrB_free (&ops->state_union_monoid) ;
+    GrB_free (&ops->state_union) ;
+    GrB_free (&ops->state_capacity) ;
+}
+
+/**
+ * @brief Create the operators and semiring for the first matrix product.
+ * @param[in,out] ops Non-NULL zero-initialized bundle; its state handles receive
+ *     newly owned objects.  On failure FreeOperators releases partial setup.
+ * @param[in] work Borrowed value types and NFA state count from Init.
+ * @param[out] msg Optional buffer of at least LAGRAPH_MSG_LEN bytes.
+ * @return GrB_SUCCESS or an allocation/GraphBLAS error.  The temporary monoid
+ *     identity buffer is always released before returning.
+ */
+static int LG_RpqPath_CreateStateOperators
+(
+    LG_RpqPath_Operators *ops,
+    const LG_RpqPath_Workspace *work,
+    char *msg
+)
+{
+    int info = GrB_SUCCESS ;
+    LG_RpqPath_StateSet *empty_state_set = NULL ;
+    info = GrB_BinaryOp_new (&ops->state_union, LG_RpqPath_UnionStates,
+        work->state_set_type, work->state_set_type, work->state_set_type) ;
+    if (info != GrB_SUCCESS) goto state_cleanup ;
+
+    // The identity occupies the full UDT size, not just its C struct header.
+    // GrB_Monoid_new_UDT copies those bytes; the source buffer is then released.
+    size_t state_set_size = sizeof (LG_RpqPath_StateSet) +
+        (size_t) work->nr * sizeof (GrB_Index) ;
+    info = LAGraph_Calloc ((void **) &empty_state_set, 1, state_set_size, msg) ;
+    if (info != GrB_SUCCESS) goto state_cleanup ;
+    empty_state_set->capacity = (size_t) work->nr ;
+    info = GrB_Monoid_new_UDT (&ops->state_union_monoid, ops->state_union,
+        empty_state_set) ;
+    if (info != GrB_SUCCESS) goto state_cleanup ;
+    LAGraph_Free ((void **) &empty_state_set, NULL) ;
+
+    info = GxB_IndexBinaryOp_new (&ops->collect_state, LG_RpqPath_CollectState,
+        work->state_set_type, GrB_BOOL, GrB_BOOL, GrB_UINT64,
+        "LG_RpqPath_CollectState", NULL) ;
+    if (info != GrB_SUCCESS) goto state_cleanup ;
+    info = GrB_Scalar_new (&ops->state_capacity, GrB_UINT64) ;
+    if (info != GrB_SUCCESS) goto state_cleanup ;
+    info = GrB_Scalar_setElement_UINT64 (ops->state_capacity, (uint64_t) work->nr) ;
+    if (info != GrB_SUCCESS) goto state_cleanup ;
+    info = GxB_BinaryOp_new_IndexOp (&ops->state_multiply, ops->collect_state,
+        ops->state_capacity) ;
+    if (info != GrB_SUCCESS) goto state_cleanup ;
+    info = GrB_Semiring_new (&ops->state_semiring, ops->state_union_monoid,
+        ops->state_multiply) ;
+    if (info != GrB_SUCCESS) goto state_cleanup ;
+
+state_cleanup:
+    LAGraph_Free ((void **) &empty_state_set, NULL) ;
+    return (info) ;
+}
+
+/**
+ * @brief Create predecessor-set addition and the indexed second-product operator.
+ * @param[in,out] ops Non-NULL bundle with zero predecessor handles.  Partial
+ *     setup remains registered here for FreeOperators if creation fails.
+ * @param[in] work Borrowed value types from Init.
+ * @param[in] pool Non-NULL initialized arena, borrowed through all uses of its
+ *     empty-set identity and label-bound multipliers.
+ * @return GrB_SUCCESS or a GraphBLAS error.  The multiplier is bound per label
+ *     separately; this function creates its reusable indexed operator only.
+ */
+static int LG_RpqPath_CreatePredecessorOperators
+(
+    LG_RpqPath_Operators *ops,
+    const LG_RpqPath_Workspace *work,
+    LG_RpqPath_BlockPool *pool
+)
+{
+    int info = GrB_SUCCESS ;
+    info = GrB_BinaryOp_new (&ops->predecessor_union, LG_RpqPath_UnionPredecessors,
+        work->temporary_set_type, work->temporary_set_type,
+        work->temporary_set_type) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    LG_RpqPath_TemporarySet empty_predecessor_set =
+        { .pool = pool, .head = NULL } ;
+    info = GrB_Monoid_new_UDT (&ops->predecessor_union_monoid,
+        ops->predecessor_union, &empty_predecessor_set) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    info = GrB_Type_new (&ops->predecessor_context_type,
+        sizeof (LG_RpqPath_PredecessorContext)) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    info = GxB_IndexBinaryOp_new (&ops->collect_predecessors,
+        LG_RpqPath_CollectPredecessors, work->temporary_set_type,
+        work->state_set_type, GrB_BOOL, ops->predecessor_context_type,
+        "LG_RpqPath_CollectPredecessors", NULL) ;
+    if (info != GrB_SUCCESS) return (info) ;
+
+    // Correctness workaround for SuiteSparse's generic flipped indexed SAXPY
+    // kernel: it sizes operand buffers using GB_GENERIC_FLIPXY, overlooking
+    // GB_GENERIC_IDX_FLIPXY.  StateSet x bool can therefore copy a full StateSet
+    // into a bool-sized buffer when the backend swaps operands for CSR/CSC.
+    // The generic dot kernel handles mixed operand sizes correctly.  This is
+    // an explicit backend restriction, not a performance tuning decision.
+    info = GrB_Descriptor_new (&ops->predecessor_product) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    info = GrB_Descriptor_set (ops->predecessor_product,
+        GxB_AxB_METHOD, GxB_AxB_DOT) ;
+    if (info != GrB_SUCCESS) return (info) ;
+
+    return (GrB_SUCCESS) ;
+}
+
+/**
+ * @brief Create the mixed operators and empty scalars for P and the new frontier.
+ * @param[in,out] ops Non-NULL bundle with zero accumulation handles.  Partial
+ *     setup remains registered here for FreeOperators on failure.
+ * @param[in] work Borrowed temporary/stored predecessor value types from Init.
+ * @param[in] pool Non-NULL arena borrowed by the empty temporary-set scalar.
+ * @return GrB_SUCCESS or a GraphBLAS error.  The stored-set merger is bound to
+ *     a new owner on each iteration, after the old-P comparison finishes.
+ */
+static int LG_RpqPath_CreateAccumulationOperators
+(
+    LG_RpqPath_Operators *ops,
+    const LG_RpqPath_Workspace *work,
+    LG_RpqPath_BlockPool *pool
+)
+{
+    int info = GrB_SUCCESS ;
+    LG_RpqPath_TemporarySet empty_predecessor_set =
+        { .pool = pool, .head = NULL } ;
+    info = GrB_BinaryOp_new (&ops->has_new_predecessors,
+        LG_RpqPath_HasNewPredecessors, GrB_BOOL,
+        work->temporary_set_type, work->stored_set_type) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    info = GrB_Type_new (&ops->stored_context_type,
+        sizeof (LG_RpqPath_StoredContext)) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    info = GxB_IndexBinaryOp_new (&ops->merge_predecessors,
+        LG_RpqPath_MergePredecessors, work->stored_set_type,
+        work->temporary_set_type, work->stored_set_type, ops->stored_context_type,
+        "LG_RpqPath_MergePredecessors", NULL) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    info = GrB_Scalar_new (&ops->empty_temporary, work->temporary_set_type) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    info = GrB_Scalar_setElement_UDT (ops->empty_temporary, &empty_predecessor_set) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    info = GrB_Scalar_new (&ops->empty_stored, work->stored_set_type) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    LG_RpqPath_StoredSet empty_stored_set = { .count = 0, .allocation = NULL } ;
+    info = GrB_Scalar_setElement_UDT (ops->empty_stored, &empty_stored_set) ;
+    if (info != GrB_SUCCESS) return (info) ;
+
+    return (GrB_SUCCESS) ;
+}
+
+/**
+ * @brief Bind the current pool/label and create the second-product semiring.
+ * @param[out] semiring Non-NULL address of a NULL handle receiving the semiring.
+ * @param[out] multiply Non-NULL address of a NULL handle receiving its operator.
+ * @param[out] scalar Non-NULL address of a NULL handle receiving the bound scalar.
+ * @param[in] ops Borrowed initialized predecessor operators and monoid.
+ * @param[in] pool Non-NULL traversal arena, alive through the completed product.
+ * @param[in] label Current decomposition label index to store in predecessors.
+ * @return GrB_SUCCESS or a GraphBLAS error.  All created handles, including
+ *     partial setup on failure, belong to the caller.  Free them after C waits.
+ */
+static int LG_RpqPath_CreatePredecessorSemiring
+(
+    GrB_Semiring *semiring,
+    GrB_BinaryOp *multiply,
+    GrB_Scalar *scalar,
+    const LG_RpqPath_Operators *ops,
+    LG_RpqPath_BlockPool *pool,
+    size_t label
+)
+{
+    LG_RpqPath_PredecessorContext context = { .pool = pool, .label = label } ;
+    int info = GrB_Scalar_new (scalar, ops->predecessor_context_type) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    info = GrB_Scalar_setElement_UDT (*scalar, &context) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    info = GxB_BinaryOp_new_IndexOp (multiply, ops->collect_predecessors,
+        *scalar) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    return (GrB_Semiring_new (semiring, ops->predecessor_union_monoid,
+        *multiply)) ;
+}
+
+/**
+ * @brief Bind the P-merging operator to this iteration's new buffer owner.
+ * @param[out] merge Non-NULL address of a NULL handle receiving the operator.
+ * @param[out] scalar Non-NULL address of a NULL handle receiving its bound scalar.
+ * @param[in] ops Borrowed initialized accumulation operators and context type.
+ * @param[in] owner Non-NULL initialized new-buffer owner, alive through wait(P).
+ * @return GrB_SUCCESS or a GraphBLAS error.  Created handles, including partial
+ *     setup on failure, belong to the caller and are freed in iteration cleanup.
+ */
+static int LG_RpqPath_CreateStoredMerge
+(
+    GrB_BinaryOp *merge,
+    GrB_Scalar *scalar,
+    const LG_RpqPath_Operators *ops,
+    LG_RpqPath_StoredOwner *owner
+)
+{
+    LG_RpqPath_StoredContext context = { .owner = owner } ;
+    int info = GrB_Scalar_new (scalar, ops->stored_context_type) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    info = GrB_Scalar_setElement_UDT (*scalar, &context) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    return (GxB_BinaryOp_new_IndexOp (merge, ops->merge_predecessors, *scalar)) ;
+}
+
 /**
  * @brief Build and return the accumulation matrix, without reconstructing paths.
  * @param[out] P_handle Non-NULL address receiving an owned, materialized P.
@@ -1850,33 +2108,7 @@ int LG_RpqPath_Traverse
         .error = ATOMIC_VAR_INIT (GrB_SUCCESS)
     } ;
 
-    // The first product uses one query-specific semiring for all labels.
-    // Operators are local to this traversal, just like its matrices.
-    GrB_BinaryOp state_union = NULL ;
-    GrB_Monoid state_union_monoid = NULL ;
-    GxB_IndexBinaryOp collect_state = NULL ;
-    GrB_BinaryOp state_multiply = NULL ;
-    GrB_Semiring state_semiring = NULL ;
-    GrB_Scalar state_capacity = NULL ;
-    LG_RpqPath_StateSet *empty_state_set = NULL ;
-
-    // The second product reduces with predecessor-set union and binds a pool
-    // pointer and label to its indexed multiplier separately for each label.
-    GrB_BinaryOp predecessor_union = NULL ;
-    GrB_Monoid predecessor_union_monoid = NULL ;
-    GxB_IndexBinaryOp collect_predecessors = NULL ;
-    GrB_Type predecessor_context_type = NULL ;
-    GrB_Descriptor predecessor_product = NULL ;
-
-    // Read-only comparison of C with the old P produces Boolean change flags.
-    GrB_BinaryOp has_new_predecessors = NULL ;
-    GrB_Scalar empty_temporary = NULL ;
-    GrB_Scalar empty_stored = NULL ;
-
-    // A second mixed operator returns StoredSet instead of bool.  Its bound
-    // context selects the owner for newly allocated P buffers each iteration.
-    GxB_IndexBinaryOp merge_predecessors = NULL ;
-    GrB_Type stored_context_type = NULL ;
+    LG_RpqPath_Operators ops = { 0 } ;
 
     // All temporary C values in this traversal will borrow this local pool.
     // Its backing array survives iterations; the reservation index is reset.
@@ -1893,87 +2125,11 @@ int LG_RpqPath_Traverse
     info = LG_RpqPath_PoolInit (&pool, LG_RPQ_PATH_POOL_BLOCKS, msg) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
 
-    info = GrB_BinaryOp_new (&state_union, LG_RpqPath_UnionStates,
-        work->state_set_type, work->state_set_type, work->state_set_type) ;
+    info = LG_RpqPath_CreateStateOperators (&ops, work, msg) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
-
-    // The identity occupies the full UDT size, not just its C struct header.
-    // GrB_Monoid_new_UDT copies those bytes; the source buffer is then released.
-    size_t state_set_size = sizeof (LG_RpqPath_StateSet) +
-        (size_t) work->nr * sizeof (GrB_Index) ;
-    info = LAGraph_Calloc ((void **) &empty_state_set, 1, state_set_size, msg) ;
+    info = LG_RpqPath_CreatePredecessorOperators (&ops, work, &pool) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    empty_state_set->capacity = (size_t) work->nr ;
-    info = GrB_Monoid_new_UDT (&state_union_monoid, state_union,
-        empty_state_set) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    LAGraph_Free ((void **) &empty_state_set, NULL) ;
-
-    info = GxB_IndexBinaryOp_new (&collect_state, LG_RpqPath_CollectState,
-        work->state_set_type, GrB_BOOL, GrB_BOOL, GrB_UINT64,
-        "LG_RpqPath_CollectState", NULL) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    info = GrB_Scalar_new (&state_capacity, GrB_UINT64) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    info = GrB_Scalar_setElement_UINT64 (state_capacity, (uint64_t) work->nr) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    info = GxB_BinaryOp_new_IndexOp (&state_multiply, collect_state,
-        state_capacity) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    info = GrB_Semiring_new (&state_semiring, state_union_monoid,
-        state_multiply) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-
-    info = GrB_BinaryOp_new (&predecessor_union, LG_RpqPath_UnionPredecessors,
-        work->temporary_set_type, work->temporary_set_type,
-        work->temporary_set_type) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    LG_RpqPath_TemporarySet empty_predecessor_set =
-        { .pool = &pool, .head = NULL } ;
-    info = GrB_Monoid_new_UDT (&predecessor_union_monoid, predecessor_union,
-        &empty_predecessor_set) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    info = GrB_Type_new (&predecessor_context_type,
-        sizeof (LG_RpqPath_PredecessorContext)) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    info = GxB_IndexBinaryOp_new (&collect_predecessors,
-        LG_RpqPath_CollectPredecessors, work->temporary_set_type,
-        work->state_set_type, GrB_BOOL, predecessor_context_type,
-        "LG_RpqPath_CollectPredecessors", NULL) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-
-    // Correctness workaround for SuiteSparse's generic flipped indexed SAXPY
-    // kernel: it sizes operand buffers using GB_GENERIC_FLIPXY, overlooking
-    // GB_GENERIC_IDX_FLIPXY.  StateSet x bool can therefore copy a full StateSet
-    // into a bool-sized buffer when the backend swaps operands for CSR/CSC.
-    // The generic dot kernel handles mixed operand sizes correctly.  This is
-    // an explicit backend restriction, not a performance tuning decision.
-    info = GrB_Descriptor_new (&predecessor_product) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    info = GrB_Descriptor_set (predecessor_product,
-        GxB_AxB_METHOD, GxB_AxB_DOT) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-
-    info = GrB_BinaryOp_new (&has_new_predecessors,
-        LG_RpqPath_HasNewPredecessors, GrB_BOOL,
-        work->temporary_set_type, work->stored_set_type) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    info = GrB_Type_new (&stored_context_type,
-        sizeof (LG_RpqPath_StoredContext)) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    info = GxB_IndexBinaryOp_new (&merge_predecessors,
-        LG_RpqPath_MergePredecessors, work->stored_set_type,
-        work->temporary_set_type, work->stored_set_type, stored_context_type,
-        "LG_RpqPath_MergePredecessors", NULL) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    info = GrB_Scalar_new (&empty_temporary, work->temporary_set_type) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    info = GrB_Scalar_setElement_UDT (empty_temporary, &empty_predecessor_set) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    info = GrB_Scalar_new (&empty_stored, work->stored_set_type) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    LG_RpqPath_StoredSet empty_stored_set = { .count = 0, .allocation = NULL } ;
-    info = GrB_Scalar_setElement_UDT (empty_stored, &empty_stored_set) ;
+    info = LG_RpqPath_CreateAccumulationOperators (&ops, work, &pool) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
 
     info = GrB_Matrix_new (&P, work->stored_set_type, work->nr, work->ng) ;
@@ -2024,33 +2180,24 @@ int LG_RpqPath_Traverse
             // discards the previous label's H values; frontier is only read.
             GrB_Descriptor nfa_direction = work->inverse ?
                 GrB_DESC_R : GrB_DESC_RT0 ;
-            info = GrB_mxm (H, NULL, NULL, state_semiring,
+            info = GrB_mxm (H, NULL, NULL, ops.state_semiring,
                 work->N[a], frontier, nfa_direction) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
             // No wait between the products: GraphBLAS manages the dependency
             // when the second multiplication consumes H as an input matrix.
-            LG_RpqPath_PredecessorContext context =
-                { .pool = &pool, .label = a } ;
-            info = GrB_Scalar_new (&predecessor_context,
-                predecessor_context_type) ;
-            if (info != GrB_SUCCESS) goto iteration_cleanup ;
-            info = GrB_Scalar_setElement_UDT (predecessor_context, &context) ;
-            if (info != GrB_SUCCESS) goto iteration_cleanup ;
-            info = GxB_BinaryOp_new_IndexOp (&predecessor_multiply,
-                collect_predecessors, predecessor_context) ;
-            if (info != GrB_SUCCESS) goto iteration_cleanup ;
-            info = GrB_Semiring_new (&predecessor_semiring,
-                predecessor_union_monoid, predecessor_multiply) ;
+            info = LG_RpqPath_CreatePredecessorSemiring (
+                &predecessor_semiring, &predecessor_multiply,
+                &predecessor_context, &ops, &pool, a) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
 
             // Accumulate all labels into C without replacing previous values.
             // The indexed product records j from H[p,j], which is unchanged
             // when the graph operand is transposed for an inverse label.
-            info = GrB_Descriptor_set (predecessor_product, GrB_INP1,
+            info = GrB_Descriptor_set (ops.predecessor_product, GrB_INP1,
                 work->reverse_graph[a] ? GrB_TRAN : GrB_DEFAULT) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
-            info = GrB_mxm (C, NULL, predecessor_union, predecessor_semiring,
-                H, work->A[a], predecessor_product) ;
+            info = GrB_mxm (C, NULL, ops.predecessor_union, predecessor_semiring,
+                H, work->A[a], ops.predecessor_product) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
             info = GrB_Matrix_wait (C, GrB_MATERIALIZE) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
@@ -2069,7 +2216,7 @@ int LG_RpqPath_Traverse
         // at C-only and P-only positions too; ordinary eWiseAdd would copy
         // those UDT values instead of producing the required Boolean result.
         info = GxB_Matrix_eWiseUnion (next_frontier, NULL, NULL,
-            has_new_predecessors, C, empty_temporary, P, empty_stored,
+            ops.has_new_predecessors, C, ops.empty_temporary, P, ops.empty_stored,
             GrB_DESC_R) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
         // nvals counts explicit false entries too.  Retain only true flags
@@ -2082,13 +2229,8 @@ int LG_RpqPath_Traverse
 
         // All readers used for frontier construction have finished.  Bind a
         // separate owner so the old P buffers stay alive throughout the merge.
-        LG_RpqPath_StoredContext context = { .owner = &next_stored_owner } ;
-        info = GrB_Scalar_new (&stored_context, stored_context_type) ;
-        if (info != GrB_SUCCESS) goto iteration_cleanup ;
-        info = GrB_Scalar_setElement_UDT (stored_context, &context) ;
-        if (info != GrB_SUCCESS) goto iteration_cleanup ;
-        info = GxB_BinaryOp_new_IndexOp (&stored_merge, merge_predecessors,
-            stored_context) ;
+        info = LG_RpqPath_CreateStoredMerge (&stored_merge, &stored_context,
+            &ops, &next_stored_owner) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
 
         // Update the same P matrix handle.  Every position, including P-only
@@ -2097,7 +2239,7 @@ int LG_RpqPath_Traverse
         // present on only one side and cannot handle these mixed UDT types.
         updating_P = true ;
         info = GxB_Matrix_eWiseUnion (P, NULL, NULL, stored_merge,
-            C, empty_temporary, P, empty_stored, NULL) ;
+            C, ops.empty_temporary, P, ops.empty_stored, NULL) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
         info = GrB_Matrix_wait (P, GrB_MATERIALIZE) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
@@ -2173,24 +2315,7 @@ traversal_cleanup:
     // The owner list also tracks buffers whose handles GraphBLAS discarded.
     GrB_free (&P) ;
     LG_RpqPath_StoredRelease (&stored_owner) ;
-    // Matrices have been released; their operators can now be released too.
-    GrB_free (&has_new_predecessors) ;
-    GrB_free (&merge_predecessors) ;
-    GrB_free (&stored_context_type) ;
-    GrB_free (&empty_temporary) ;
-    GrB_free (&empty_stored) ;
-    GrB_free (&predecessor_product) ;
-    GrB_free (&collect_predecessors) ;
-    GrB_free (&predecessor_union_monoid) ;
-    GrB_free (&predecessor_union) ;
-    GrB_free (&predecessor_context_type) ;
-    GrB_free (&state_semiring) ;
-    GrB_free (&state_multiply) ;
-    GrB_free (&collect_state) ;
-    GrB_free (&state_union_monoid) ;
-    GrB_free (&state_union) ;
-    GrB_free (&state_capacity) ;
-    LAGraph_Free ((void **) &empty_state_set, NULL) ;
+    LG_RpqPath_FreeOperators (&ops) ;
     LG_RpqPath_PoolDestroy (&pool) ;
     if (info == GrB_OUT_OF_MEMORY && pool_exhausted)
     {
