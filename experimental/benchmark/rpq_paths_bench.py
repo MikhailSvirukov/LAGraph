@@ -15,10 +15,16 @@ def main():
                         help="graph matrices: <label>.mtx or <label>=<path>")
     parser.add_argument("--semantics", choices=("all", "simple", "trails", "shortest"),
                         default="all")
+    parser.add_argument("--warmup", type=int, default=0,
+                        help="unreported passes over the full batch (default: 0)")
+    parser.add_argument("--iterations", type=int, default=1,
+                        help="measured passes over the full batch (default: 1)")
     parser.add_argument("--build-dir", type=Path,
                         default=Path(__file__).resolve().parents[2] / "build",
                         help="LAGraph CMake build directory (default: build)")
     args = parser.parse_args()
+    if args.warmup < 0 or args.iterations < 1:
+        parser.error("--warmup must be nonnegative and --iterations must be positive")
     driver = args.build_dir / "experimental/benchmark/rpq_paths_demo"
     if not driver.is_file():
         parser.error(f"missing {driver}; build the rpq_paths_demo CMake target first")
@@ -40,7 +46,8 @@ def main():
         if label in matrices:
             parser.error(f"duplicate graph label: {label}")
         matrices[label] = path
-    command = [str(driver.resolve()), args.semantics, str(len(matrices)),
+    command = [str(driver.resolve()), args.semantics, str(args.warmup),
+               str(args.iterations), str(len(matrices)),
                *(str(p.resolve()) for p in matrices.values())]
     for meta in queries:
         number = meta.name[:-9]

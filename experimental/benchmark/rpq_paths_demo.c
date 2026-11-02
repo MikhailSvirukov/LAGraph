@@ -135,19 +135,21 @@ cleanup:
     return (info) ;
 }
 
-/** Load one NFA and its sources, call the API and print its time and path count.
+/** Load one NFA and its sources, call the API and release all query resources.
  * @param[in] files Query number, metadata path, sources path, then nl NFA paths.
  *     A path of "-" denotes an absent NFA label.
  * @param[in] G Borrowed graph decomposition, loaded once for the whole batch.
  * @param[in] nl Number of label slots shared by G and the NFA path list.
  * @param[in] query Selected public query function.
+ * @param[out] seconds Receives the elapsed time of the public query call.
+ * @param[out] count Receives the returned path count; valid only on success.
  * @param[out] msg Optional LAGRAPH_MSG_LEN-byte error buffer.
  * @return GrB_SUCCESS or an input/allocation/algorithm error.
  */
 static int run_query
 (
     char *const *files, LAGraph_Graph *G, size_t nl,
-    QueryFunction query, char *msg
+    QueryFunction query, double *seconds, size_t *count, char *msg
 )
 {
     FILE *meta = NULL ;
@@ -186,11 +188,10 @@ static int run_query
     double begin = LAGraph_WallClockTime ( ) ;
     info = query (&paths, &path_count, R, inverse_labels, nl,
         QS, nqs, QF, nqf, G, S, ns, false, msg) ;
-    double seconds = LAGraph_WallClockTime ( ) - begin ;
+    *seconds = LAGraph_WallClockTime ( ) - begin ;
     if (info != GrB_SUCCESS) goto cleanup ;
 
-    printf ("%s\t%.9f\t%zu\n", files[0], seconds, path_count) ;
-    fflush (stdout) ;
+    *count = path_count ;
 cleanup:
     if (meta != NULL) fclose (meta) ;
     if (R != NULL)
@@ -204,23 +205,41 @@ cleanup:
     return (info) ;
 }
 
-// The Python launcher supplies: semantics nl graph_files... followed by query
+typedef struct
+{
+    double seconds ;                // sum of measured query times
+    size_t paths ;                  // identical across measured passes
+    bool failed ;                   // suppress incomplete/invalid averages
+}
+BenchmarkResult ;
+
+// The Python launcher supplies: semantics warmup iterations nl graph_files...
+// followed by query
 // blocks: number meta_file sources_file nfa_files... (nl entries, "-" if absent).
 int main (int argc, char **argv)
 {
-    if (argc < 8) return (EXIT_FAILURE) ;
+    if (argc < 10) return (EXIT_FAILURE) ;
     QueryFunction query = NULL ;
     if (!strcmp (argv[1], "all")) query = LAGraph_2RpqPath_AllPaths ;
     if (!strcmp (argv[1], "simple")) query = LAGraph_2RpqPath_AllSimple ;
     if (!strcmp (argv[1], "trails")) query = LAGraph_2RpqPath_AllTrails ;
     if (!strcmp (argv[1], "shortest")) query = LAGraph_2RpqPath_AllShortestPaths ;
     char *end = NULL ;
-    long n = strtol (argv[2], &end, 10) ;
-    if (query == NULL || *end != '\0' || n < 1 || n > (argc - 6) / 2 ||
-        (argc - 3 - n) % (n + 3) != 0)
+    errno = 0 ;
+    long warmup = strtol (argv[2], &end, 10) ;
+    if (errno || *end != '\0' || end == argv[2] || warmup < 0)
         return (EXIT_FAILURE) ;
+    long iterations = strtol (argv[3], &end, 10) ;
+    if (errno || *end != '\0' || end == argv[3] || iterations < 1)
+        return (EXIT_FAILURE) ;
+    long n = strtol (argv[4], &end, 10) ;
+    if (errno || query == NULL || *end != '\0' || n < 1 || n > (argc - 8) / 2 ||
+        (argc - 5 - n) % (n + 3) != 0)
+        return (EXIT_FAILURE) ;
+    size_t query_count = (argc - 5 - n) / (n + 3) ;
     char msg [LAGRAPH_MSG_LEN] = "" ;
     LAGraph_Graph *G = NULL ;
+    BenchmarkResult *results = NULL ;
     bool failed = false ;
     int info = LAGraph_Init (msg) ;
     if (info != GrB_SUCCESS)
@@ -230,10 +249,13 @@ int main (int argc, char **argv)
     }
     info = LAGraph_Calloc ((void **) &G, (size_t) n, sizeof (LAGraph_Graph), msg) ;
     if (info != GrB_SUCCESS) goto cleanup ;
+    info = LAGraph_Calloc ((void **) &results, query_count,
+        sizeof (BenchmarkResult), msg) ;
+    if (info != GrB_SUCCESS) goto cleanup ;
     GrB_Index ng = 0 ;
     for (long k = 0 ; k < n ; k++)
     {
-        info = read_graph (&G[k], argv[3 + k], msg) ;
+        info = read_graph (&G[k], argv[5 + k], msg) ;
         if (info != GrB_SUCCESS) goto cleanup ;
         GrB_Index size = 0 ;
         info = GrB_Matrix_nrows (&size, G[k]->A) ;
@@ -246,21 +268,54 @@ int main (int argc, char **argv)
         }
         ng = size ;
     }
-    printf ("query\ttime_seconds\tpaths\n") ;
-    for (int k = 3 + (int) n ; k < argc ; k += (int) n + 3)
+    // Finish every warmup batch before starting measured batches.  Keeping
+    // phases separate also avoids overflowing warmup + iterations.
+    for (int phase = 0 ; phase < 2 ; phase++)
     {
-        msg[0] = '\0' ;
-        int query_info = run_query (argv + k, G, (size_t) n, query, msg) ;
-        if (query_info != GrB_SUCCESS)
+        long passes = phase == 0 ? warmup : iterations ;
+        for (long pass = 0 ; pass < passes ; pass++)
         {
-            fprintf (stderr, "%s: info=%d %s\n", argv[k], query_info, msg) ;
-            failed = true ;
+            for (size_t q = 0 ; q < query_count ; q++)
+            {
+                char **files = argv + 5 + n + q * (n + 3) ;
+                double seconds = 0 ;
+                size_t count = 0 ;
+                msg[0] = '\0' ;
+                int query_info = run_query (files, G, (size_t) n, query,
+                    &seconds, &count, msg) ;
+                if (query_info != GrB_SUCCESS)
+                {
+                    fprintf (stderr, "%s: %s pass %ld: info=%d %s\n",
+                        files[0], phase == 0 ? "warmup" : "measured",
+                        pass + 1, query_info, msg) ;
+                    failed = results[q].failed = true ;
+                    continue ;
+                }
+                if (phase == 0) continue ;
+                if (pass > 0 && results[q].paths != count)
+                {
+                    fprintf (stderr, "%s: path count changed between iterations\n",
+                        files[0]) ;
+                    failed = results[q].failed = true ;
+                }
+                results[q].seconds += seconds ;
+                results[q].paths = count ;
+            }
         }
+    }
+    printf ("query\ttime_seconds\tpaths\n") ;
+    for (size_t q = 0 ; q < query_count ; q++)
+    {
+        if (results[q].failed) continue ;
+        const char *number = argv[5 + n + q * (n + 3)] ;
+        printf ("%s\t%.9f\t%zu\n", number,
+            results[q].seconds / iterations, results[q].paths) ;
     }
 cleanup:
     if (G != NULL)
         for (long k = 0 ; k < n ; k++) LAGraph_Delete (&G[k], NULL) ;
     LAGraph_Free ((void **) &G, NULL) ;
+    LAGraph_Free ((void **) &results, NULL) ;
     if (info != GrB_SUCCESS) fprintf (stderr, "info=%d %s\n", info, msg) ;
     LAGraph_Finalize (NULL) ;
     return (failed || info != GrB_SUCCESS ? EXIT_FAILURE : EXIT_SUCCESS) ;
