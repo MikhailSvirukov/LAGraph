@@ -1947,6 +1947,76 @@ static void test_shortest_late_shorter_and_tie (void)
     test_check_query (&query) ;
 }
 
+/*
+ * Graph:       +--a--> 1
+ *          [0] +--a--> 2
+ *              ...
+ *              +--a--> 1100
+ * NFA: -->q0 --a--> ((q1))
+ *
+ * Expected: 1100 distinct one-edge paths (0,a,i), i=1,...,1100.
+ * The first step needs at least one temporary block per destination, exceeding
+ * the former 1024-block arena limit.  Later steps must preserve all paths after
+ * the temporary blocks from the first step have been freed.
+ */
+static void test_wide_graph (void)
+{
+    TestEdge graph [1100] ;
+    ExpectedPath expected [1100] ;
+    for (size_t k = 0 ; k < ARRAY_COUNT (graph) ; k++)
+    {
+        graph[k] = (TestEdge) { 0, 0, k + 1 } ;
+        expected[k] = (ExpectedPath) { 1, { 0, 0, k + 1 } } ;
+    }
+    const TestEdge automaton [] = { { 0, 0, 1 } } ;
+    const TestQuery query =
+    {
+        .graph_vertices = 1101, .automaton_states = 2,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 1 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected, .expected_count = ARRAY_COUNT (expected)
+    } ;
+    test_check_query (&query) ;
+}
+
+/*
+ * Graph:           +--> 1  --+
+ *              [0] --a--> ... a--> 66
+ *                  +--> 65 --+
+ * NFA: -->q0 --a--> q1 --a--> ((q2))
+ *
+ * The final configuration has 65 distinct predecessors, spanning more than
+ * one default 64-record temporary block.  Expected: (0,a,i,a,66) for i=1,...,65.
+ */
+static void test_many_predecessors (void)
+{
+    TestEdge graph [130] ;
+    const TestEdge automaton [] = { { 0, 0, 1 }, { 1, 0, 2 } } ;
+    ExpectedPath expected [65] ;
+    for (size_t k = 0 ; k < 65 ; k++)
+    {
+        graph[2 * k] = (TestEdge) { 0, 0, k + 1 } ;
+        graph[2 * k + 1] = (TestEdge) { k + 1, 0, 66 } ;
+        expected[k] = (ExpectedPath) { 2, { 0, 0, k + 1, 0, 66 } } ;
+    }
+    const TestQuery query =
+    {
+        .graph_vertices = 67, .automaton_states = 3,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1,
+        .QF = { 2 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected, .expected_count = ARRAY_COUNT (expected)
+    } ;
+    test_check_query (&query) ;
+}
+
 TEST_LIST =
 {
     { "RpqPath_chain", test_chain },
@@ -1968,6 +2038,8 @@ TEST_LIST =
     { "RpqPath_long_chain", test_long_chain },
     { "RpqPath_nonaccepting_cycle", test_nonaccepting_cycle },
     { "RpqPath_length_limit", test_length_limit },
+    { "RpqPath_wide_graph", test_wide_graph },
+    { "RpqPath_many_predecessors", test_many_predecessors },
     { "RpqPath_simple_repeated_vertex", test_simple_repeated_vertex },
     { "RpqPath_simple_self_loop", test_simple_self_loop },
     { "RpqPath_simple_closed_path", test_simple_closed_path },
