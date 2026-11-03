@@ -1371,8 +1371,7 @@ int LG_RpqPath_Init
     return (GrB_SUCCESS) ;
 }
 
-// Traversal-local GraphBLAS handles only.  Matrix values and iteration-owned
-// bindings remain local variables in Traverse; this bundle owns no matrices.
+// Traversal-local GraphBLAS handles only; this bundle owns no matrices.
 typedef struct
 {
     GrB_BinaryOp state_union ;
@@ -1394,12 +1393,21 @@ typedef struct
 }
 LG_RpqPath_Operators ;
 
+// One immutable binding per label, reused by every traversal iteration.
+typedef struct
+{
+    GrB_Semiring semiring ;
+    GrB_BinaryOp multiply ;
+    GrB_Scalar context ;
+}
+LG_RpqPath_LabelOperators ;
+
 /**
  * @brief Free a complete or partially initialized traversal operator bundle.
  * @param[in,out] ops Non-NULL bundle initially zero-initialized before creation.
  *     Owned handles are freed and cleared; repeat calls are safe.
  * @pre All operations using these handles have completed, and their per-label
- *     and per-iteration bindings have been freed.  Materialized P may survive.
+ *     and stored-merge bindings have been freed.  Materialized P may survive.
  */
 static void LG_RpqPath_FreeOperators (LG_RpqPath_Operators *ops)
 {
@@ -1534,7 +1542,7 @@ static int LG_RpqPath_CreatePredecessorOperators
  * @param[in] work Borrowed temporary/stored predecessor value types from Init.
  * @param[in] pool Non-NULL arena borrowed by the empty temporary-set scalar.
  * @return GrB_SUCCESS or a GraphBLAS error.  The stored-set merger is bound to
- *     a new owner on each iteration, after the old-P comparison finishes.
+ *     a reusable new-buffer owner separately, before traversal starts.
  */
 static int LG_RpqPath_CreateAccumulationOperators
 (
@@ -1577,10 +1585,11 @@ static int LG_RpqPath_CreateAccumulationOperators
  * @param[out] multiply Non-NULL address of a NULL handle receiving its operator.
  * @param[out] scalar Non-NULL address of a NULL handle receiving the bound scalar.
  * @param[in] ops Borrowed initialized predecessor operators and monoid.
- * @param[in] pool Non-NULL traversal arena, alive through the completed product.
+ * @param[in] pool Non-NULL traversal arena, alive through all products.
  * @param[in] label Current decomposition label index to store in predecessors.
  * @return GrB_SUCCESS or a GraphBLAS error.  All created handles, including
- *     partial setup on failure, belong to the caller.  Free them after C waits.
+ *     partial setup on failure, belong to the caller.  Reuse them across
+ *     iterations and free them after all traversal products have completed.
  */
 static int LG_RpqPath_CreatePredecessorSemiring
 (
@@ -1605,13 +1614,14 @@ static int LG_RpqPath_CreatePredecessorSemiring
 }
 
 /**
- * @brief Bind the P-merging operator to this iteration's new buffer owner.
+ * @brief Bind the P-merging operator to a reusable new-buffer owner.
  * @param[out] merge Non-NULL address of a NULL handle receiving the operator.
  * @param[out] scalar Non-NULL address of a NULL handle receiving its bound scalar.
  * @param[in] ops Borrowed initialized accumulation operators and context type.
- * @param[in] owner Non-NULL initialized new-buffer owner, alive through wait(P).
+ * @param[in] owner Non-NULL initialized new-buffer owner, alive throughout
+ *     traversal.  Transfer its allocations and reset it only after wait(P).
  * @return GrB_SUCCESS or a GraphBLAS error.  Created handles, including partial
- *     setup on failure, belong to the caller and are freed in iteration cleanup.
+ *     setup on failure, belong to the caller and are freed in traversal cleanup.
  */
 static int LG_RpqPath_CreateStoredMerge
 (
@@ -1670,6 +1680,16 @@ int LG_RpqPath_Traverse
         .error = ATOMIC_VAR_INIT (GrB_SUCCESS)
     } ;
 
+    // The bound merger keeps this address for the entire traversal.  Each
+    // completed iteration transfers its allocations to stored_owner.
+    LG_RpqPath_StoredOwner next_stored_owner =
+    {
+        .allocations = ATOMIC_VAR_INIT (NULL),
+        .error = ATOMIC_VAR_INIT (GrB_SUCCESS)
+    } ;
+    GrB_Scalar stored_context = NULL ;
+    GrB_BinaryOp stored_merge = NULL ;
+    LG_RpqPath_LabelOperators *label_ops = NULL ;
     LG_RpqPath_Operators ops = { 0 } ;
 
     // All temporary C values in this traversal will borrow this local pool.
@@ -1687,6 +1707,21 @@ int LG_RpqPath_Traverse
     info = LG_RpqPath_CreateAccumulationOperators (&ops, work, &pool) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
 
+    info = LAGraph_Calloc ((void **) &label_ops, work->nl,
+        sizeof (LG_RpqPath_LabelOperators), msg) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    for (size_t a = 0 ; a < work->nl ; a++)
+    {
+        if (work->A[a] == NULL || work->N[a] == NULL) continue ;
+        info = LG_RpqPath_CreatePredecessorSemiring (
+            &label_ops[a].semiring, &label_ops[a].multiply,
+            &label_ops[a].context, &ops, &pool, a) ;
+        if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    }
+    info = LG_RpqPath_CreateStoredMerge (&stored_merge, &stored_context,
+        &ops, &next_stored_owner) ;
+    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+
     info = GrB_Matrix_new (&P, work->stored_set_type, work->nr, work->ng) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
     info = GrB_Matrix_dup (&frontier, roots) ;
@@ -1701,21 +1736,7 @@ int LG_RpqPath_Traverse
         GrB_Matrix C = NULL ;
         GrB_Matrix next_frontier = NULL ;
 
-        LG_RpqPath_StoredOwner next_stored_owner =
-        {
-            .allocations = ATOMIC_VAR_INIT (NULL),
-            .error = ATOMIC_VAR_INIT (GrB_SUCCESS)
-        } ;
-        GrB_Scalar stored_context = NULL ;
-        GrB_BinaryOp stored_merge = NULL ;
         bool updating_P = false ;
-
-        // A bound index operator copies its scalar, so the multiplier and its
-        // semiring must be recreated when the label changes.  Keep their
-        // handles in this scope to clean partial construction on error too.
-        GrB_Scalar predecessor_context = NULL ;
-        GrB_BinaryOp predecessor_multiply = NULL ;
-        GrB_Semiring predecessor_semiring = NULL ;
 
         info = GrB_Matrix_new (&H, work->state_set_type, work->nr, work->ng) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
@@ -1740,30 +1761,19 @@ int LG_RpqPath_Traverse
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
             // No wait between the products: GraphBLAS manages the dependency
             // when the second multiplication consumes H as an input matrix.
-            info = LG_RpqPath_CreatePredecessorSemiring (
-                &predecessor_semiring, &predecessor_multiply,
-                &predecessor_context, &ops, &pool, a) ;
-            if (info != GrB_SUCCESS) goto iteration_cleanup ;
-
             // Accumulate all labels into C without replacing previous values.
             // The indexed product records j from H[p,j], which is unchanged
             // when the graph operand is transposed for an inverse label.
             info = GrB_Descriptor_set (ops.predecessor_product, GrB_INP1,
                 work->reverse_graph[a] ? GrB_TRAN : GrB_DEFAULT) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
-            info = GrB_mxm (C, NULL, ops.predecessor_union, predecessor_semiring,
+            info = GrB_mxm (C, NULL, ops.predecessor_union, label_ops[a].semiring,
                 H, work->A[a], ops.predecessor_product) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
             info = GrB_Matrix_wait (C, GrB_MATERIALIZE) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
             info = atomic_load (&pool.error) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
-
-            // C is materialized and no longer needs these label-bound objects.
-            // The arena itself remains live until the whole iteration ends.
-            GrB_free (&predecessor_semiring) ;
-            GrB_free (&predecessor_multiply) ;
-            GrB_free (&predecessor_context) ;
         }
 
         // Compare against the OLD P, substituting an empty set wherever a
@@ -1780,12 +1790,6 @@ int LG_RpqPath_Traverse
             GrB_VALUEEQ_BOOL, next_frontier, true, GrB_DESC_R) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
         info = GrB_Matrix_wait (next_frontier, GrB_MATERIALIZE) ;
-        if (info != GrB_SUCCESS) goto iteration_cleanup ;
-
-        // All readers used for frontier construction have finished.  Bind a
-        // separate owner so the old P buffers stay alive throughout the merge.
-        info = LG_RpqPath_CreateStoredMerge (&stored_merge, &stored_context,
-            &ops, &next_stored_owner) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
 
         // Update the same P matrix handle.  Every position, including P-only
@@ -1848,11 +1852,6 @@ iteration_cleanup:
         GrB_free (&H) ;
         GrB_free (&C) ;
         GrB_free (&next_frontier) ;
-        GrB_free (&predecessor_semiring) ;
-        GrB_free (&predecessor_multiply) ;
-        GrB_free (&predecessor_context) ;
-        GrB_free (&stored_merge) ;
-        GrB_free (&stored_context) ;
         LG_RpqPath_StoredRelease (&next_stored_owner) ;
         LG_RpqPath_PoolReset (&pool) ;
         if (info != GrB_SUCCESS) goto traversal_cleanup ;
@@ -1870,6 +1869,19 @@ traversal_cleanup:
     // The owner list also tracks buffers whose handles GraphBLAS discarded.
     GrB_free (&P) ;
     LG_RpqPath_StoredRelease (&stored_owner) ;
+    LG_RpqPath_StoredRelease (&next_stored_owner) ;
+    GrB_free (&stored_merge) ;
+    GrB_free (&stored_context) ;
+    if (label_ops != NULL)
+    {
+        for (size_t a = 0 ; a < work->nl ; a++)
+        {
+            GrB_free (&label_ops[a].semiring) ;
+            GrB_free (&label_ops[a].multiply) ;
+            GrB_free (&label_ops[a].context) ;
+        }
+        LAGraph_Free ((void **) &label_ops, NULL) ;
+    }
     LG_RpqPath_FreeOperators (&ops) ;
     LG_RpqPath_PoolDestroy (&pool) ;
     if (info == GrB_OUT_OF_MEMORY && pool_allocation_failed)
