@@ -12,7 +12,7 @@ def main():
     parser.add_argument("queries", type=Path,
                         help="numbered query folders with meta.txt, or flat <number>_meta.txt files")
     parser.add_argument("matrices", nargs="+",
-                        help="graph matrices: <label>.txt/.mtx or <label>=<path>")
+                        help="matrix directory, individual <label>.txt/.mtx files, or <label>=<path>")
     parser.add_argument("--semantics", choices=("all", "simple", "trails", "shortest"),
                         default="all")
     parser.add_argument("--warmup", type=int, default=0,
@@ -40,14 +40,27 @@ def main():
                          key=lambda p: int(p.name[:-9]))
     if not queries:
         parser.error("no numbered query folders or <number>_meta.txt files")
-    matrices = {}
+    inputs = []
     for value in args.matrices:
+        path = Path(value)
+        if path.is_dir():
+            files = sorted((p for p in path.iterdir()
+                            if p.is_file() and p.stem.isdecimal() and int(p.stem) > 0
+                            and p.suffix.lower() in (".txt", ".mtx", ".mat")),
+                           key=lambda p: (int(p.stem), p.name))
+            if not files:
+                parser.error(f"no numeric matrix files (.txt/.mtx/.mat) in directory: {path}")
+            inputs.extend(str(p) for p in files)
+        else:
+            inputs.append(value)
+    matrices = {}
+    for value in inputs:
         label, separator, filename = value.partition("=")
         path = Path(filename if separator else value)
         if not separator:
             label = path.stem
         if not label or "/" in label or "\\" in label or not path.is_file():
-            parser.error(f"expected <label>.mtx or <label>=<existing-file>: {value}")
+            parser.error(f"expected a matrix directory, <label>.txt/.mtx, or <label>=<existing-file>: {value}")
         if label in matrices:
             parser.error(f"duplicate graph label: {label}")
         if layout == "folders":
