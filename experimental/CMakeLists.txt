@@ -24,7 +24,8 @@ file ( GLOB LAGRAPHX_LIB_SOURCES "utility/*.c" "algorithm/*.c" )
 #-------------------------------------------------------------------------------
 
 if ( BUILD_SHARED_LIBS )
-    add_library ( LAGraphX SHARED ${LAGRAPHX_LIB_SOURCES} )
+    add_library ( LAGraphX SHARED ${LAGRAPHX_LIB_SOURCES}
+            algorithm/LAGraph_2RpqPath.c)
     set_target_properties ( LAGraphX PROPERTIES
         VERSION ${LAGraph_VERSION_MAJOR}.${LAGraph_VERSION_MINOR}.${LAGraph_VERSION_SUB}
         SOVERSION ${LAGraph_VERSION_MAJOR}

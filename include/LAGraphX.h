@@ -858,6 +858,267 @@ int LAGraph_2RegularPathQuery   // nodes reachable from the starting by the
     char *msg                   // LAGraph output message
 );
 //****************************************************************************
+// Predecessor-based RPQ path enumeration.
+// Inputs must satisfy the documented preconditions; these functions perform
+// no input verification. The standalone benchmark supports Python --verify.
+
+/** One owned graph path: length edges and 2*length+1 integers in elements,
+ *  ordered vertex, label, vertex, ..., label, vertex.  A zero-edge path stores
+ *  one vertex.  All vertices and label indices are zero-based. */
+typedef struct
+{
+    size_t length ;
+    uint64_t *elements ;
+}
+LAGraph_RpqPath ;
+
+/**
+ * @brief Enumerate distinct graph paths satisfying the supplied NFA.
+ *
+ * @param[out] paths Non-NULL address receiving an owned array of paths.
+ *     Initially cleared to NULL; must not hold an unreleased array on entry.
+ *     Release successful results with LAGraph_2RpqPath_FreePaths.
+ * @param[out] path_count Non-NULL address receiving the array length.  Zero
+ *     with *paths=NULL denotes an empty result or an error; no partial result
+ *     is returned on error.
+ * @param[in] R NFA decomposition: nl borrowed graph handles indexed by label.
+ *     Slots may be NULL; at least one adjacency matrix must exist.
+ * @param[in] inverse_labels Non-NULL array of nl flags.  A true entry traverses
+ *     that graph label backwards, before whole-query inversion is applied.
+ * @param[in] nl Positive number of label slots shared by R and G.
+ * @param[in] QS Array of nqs initial NFA states; NULL allowed when nqs=0.
+ * @param[in] nqs Number of initial-state entries; duplicates are allowed.
+ * @param[in] QF Array of nqf accepting NFA states; NULL allowed when nqf=0.
+ * @param[in] nqf Number of accepting-state entries; duplicates are allowed.
+ * @param[in] G Graph decomposition: nl borrowed graph handles indexed by label.
+ *     Slots may be NULL; at least one adjacency matrix must exist.
+ * @param[in] S Array of ns source vertices; NULL allowed when ns=0.
+ * @param[in] ns Number of source entries; duplicates are allowed.
+ * @param[in] inverse Reverse the NFA and flip every graph label's direction.
+ *     QS, QF and S are used as supplied; the state sets are not swapped.
+ * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes;
+ *     may be NULL and is cleared on entry.
+ * @return GrB_SUCCESS, or an input, allocation or GraphBLAS error code.
+ *
+ * Repeated vertices and edges are allowed.  Reconstruction is bounded by the
+ * build-time LG_RPQ_PATH_MAX_LENGTH setting (60000 edges by default), inclusive.
+ * Reconstruction stops after LG_RPQ_PATH_MAX_COUNT distinct paths have been
+ * saved (100000 by default), returning GrB_SUCCESS with the collected prefix.
+ * Zero-edge paths are included when a source has an initial accepting state.
+ * Result sequences follow the query's traversal direction and retain original
+ * label indices.  Equal graph paths from different NFA runs are emitted once.
+ * Input graphs are not modified and no query storage is retained on return.
+ */
+LAGRAPHX_PUBLIC
+int LAGraph_2RpqPath_AllPaths
+(
+    LAGraph_RpqPath **paths,
+    size_t *path_count,
+    LAGraph_Graph *R,
+    const bool *inverse_labels,
+    size_t nl,
+    const GrB_Index *QS,
+    size_t nqs,
+    const GrB_Index *QF,
+    size_t nqf,
+    LAGraph_Graph *G,
+    const GrB_Index *S,
+    size_t ns,
+    bool inverse,
+    char *msg
+) ;
+
+/**
+ * @brief Enumerate accepted graph paths without repeated vertices.
+ *
+ * A vertex may occur only once, including the source and endpoint; closed
+ * nonempty paths and self-loops are excluded.  Zero-edge paths are allowed.
+ *
+ * @param[out] paths Non-NULL address receiving an owned array, initially cleared
+ *     to NULL.  Must not hold an unreleased result on entry.  Free successful
+ *     results with LAGraph_2RpqPath_FreePaths.
+ * @param[out] path_count Non-NULL address receiving the number of paths, or zero
+ *     on error/empty result.  No partial result is returned on error.
+ * @param[in] R Borrowed NFA decomposition with nl possibly NULL label slots.
+ *     At least one adjacency matrix must exist.
+ * @param[in] inverse_labels Non-NULL array of nl graph-direction flags.
+ * @param[in] nl Positive shared label-slot count for G, R and inverse_labels.
+ * @param[in] QS Array of nqs initial NFA states; NULL allowed when nqs=0.
+ * @param[in] nqs Number of initial-state entries; duplicates are allowed.
+ * @param[in] QF Array of nqf accepting NFA states; NULL allowed when nqf=0.
+ * @param[in] nqf Number of accepting-state entries; duplicates are allowed.
+ * @param[in] G Borrowed graph decomposition with nl possibly NULL label slots.
+ *     At least one adjacency matrix must exist.
+ * @param[in] S Array of ns source vertices; NULL allowed when ns=0.
+ * @param[in] ns Number of source entries; duplicates are allowed.
+ * @param[in] inverse Reverse the NFA and toggle every label's graph direction.
+ *     QS, QF and S are used as supplied; state sets are not swapped.
+ * @param[out] msg Optional buffer of at least LAGRAPH_MSG_LEN bytes, cleared on
+ *     entry; may be NULL.
+ * @return GrB_SUCCESS, or an input, allocation or GraphBLAS error code.
+ *
+ * Reconstruction uses the same inclusive build-time LG_RPQ_PATH_MAX_LENGTH
+ * bound and successful path-count truncation as AllPaths (60000 edges and
+ * 100000 collected paths by default).  Results retain original label
+ * indices in query traversal order.  Equal graph paths are returned once.
+ * Inputs remain unchanged and all query workspace is released before return.
+ */
+LAGRAPHX_PUBLIC
+int LAGraph_2RpqPath_AllSimple
+(
+    LAGraph_RpqPath **paths,
+    size_t *path_count,
+    LAGraph_Graph *R,
+    const bool *inverse_labels,
+    size_t nl,
+    const GrB_Index *QS,
+    size_t nqs,
+    const GrB_Index *QF,
+    size_t nqf,
+    LAGraph_Graph *G,
+    const GrB_Index *S,
+    size_t ns,
+    bool inverse,
+    char *msg
+) ;
+
+/**
+ * @brief Enumerate accepted graph paths without repeated directed labeled edges.
+ *
+ * An edge is identified by (source vertex, label index, destination vertex).
+ * Vertices may repeat.  Opposite directions or different labels identify
+ * different edges.  A self-loop may be used once.  Zero-edge paths are allowed.
+ *
+ * @param[out] paths Non-NULL address receiving an owned array, initially cleared
+ *     to NULL.  Must not hold an unreleased result on entry.  Free successful
+ *     results with LAGraph_2RpqPath_FreePaths.
+ * @param[out] path_count Non-NULL address receiving the number of paths, or zero
+ *     on error/empty result.  No partial result is returned on error.
+ * @param[in] R Borrowed NFA decomposition with nl possibly NULL label slots.
+ *     At least one adjacency matrix must exist.
+ * @param[in] inverse_labels Non-NULL array of nl graph-direction flags.
+ * @param[in] nl Positive shared label-slot count for G, R and inverse_labels.
+ * @param[in] QS Array of nqs initial NFA states; NULL allowed when nqs=0.
+ * @param[in] nqs Number of initial-state entries; duplicates are allowed.
+ * @param[in] QF Array of nqf accepting NFA states; NULL allowed when nqf=0.
+ * @param[in] nqf Number of accepting-state entries; duplicates are allowed.
+ * @param[in] G Borrowed graph decomposition with nl possibly NULL label slots.
+ *     At least one adjacency matrix must exist.
+ * @param[in] S Array of ns source vertices; NULL allowed when ns=0.
+ * @param[in] ns Number of source entries; duplicates are allowed.
+ * @param[in] inverse Reverse the NFA and toggle every label's graph direction.
+ *     QS, QF and S are used as supplied; state sets are not swapped.
+ * @param[out] msg Optional buffer of at least LAGRAPH_MSG_LEN bytes, cleared on
+ *     entry; may be NULL.
+ * @return GrB_SUCCESS, or an input, allocation or GraphBLAS error code.
+ *
+ * Reconstruction uses the same inclusive build-time LG_RPQ_PATH_MAX_LENGTH
+ * bound and successful path-count truncation as AllPaths (60000 edges and
+ * 100000 collected paths by default).  Results retain original label
+ * indices in query traversal order.  Equal graph paths are returned once.
+ * Inputs remain unchanged and all query workspace is released before return.
+ */
+LAGRAPHX_PUBLIC
+int LAGraph_2RpqPath_AllTrails
+(
+    LAGraph_RpqPath **paths,
+    size_t *path_count,
+    LAGraph_Graph *R,
+    const bool *inverse_labels,
+    size_t nl,
+    const GrB_Index *QS,
+    size_t nqs,
+    const GrB_Index *QF,
+    size_t nqf,
+    LAGraph_Graph *G,
+    const GrB_Index *S,
+    size_t ns,
+    bool inverse,
+    char *msg
+) ;
+
+/**
+ * @brief Enumerate all shortest accepted paths to each graph endpoint.
+ *
+ * Lengths count graph edges.  Minimize separately for each destination over
+ * all sources S, initial states QS and accepting states QF, retaining every
+ * distinct tied graph path.  Only paths accepted by the NFA participate in
+ * this minimum.  Repeated graph vertices and edges are allowed when required
+ * by the language.  An accepted zero-edge path dominates longer paths to its
+ * destination.
+ *
+ * @param[out] paths Non-NULL address receiving an owned array, initially cleared
+ *     to NULL.  Must not hold an unreleased result on entry.  Free successful
+ *     results with LAGraph_2RpqPath_FreePaths.
+ * @param[out] path_count Non-NULL address receiving the number of paths, or zero
+ *     on error/empty result.  No partial result is returned on error.
+ * @param[in] R Borrowed NFA decomposition with nl possibly NULL label slots.
+ *     At least one adjacency matrix must exist.
+ * @param[in] inverse_labels Non-NULL array of nl graph-direction flags.
+ * @param[in] nl Positive shared label-slot count for G, R and inverse_labels.
+ * @param[in] QS Array of nqs initial NFA states; NULL allowed when nqs=0.
+ * @param[in] nqs Number of initial-state entries; duplicates are allowed.
+ * @param[in] QF Array of nqf accepting NFA states; NULL allowed when nqf=0.
+ * @param[in] nqf Number of accepting-state entries; duplicates are allowed.
+ * @param[in] G Borrowed graph decomposition with nl possibly NULL label slots.
+ *     At least one adjacency matrix must exist.
+ * @param[in] S Array of ns source vertices; NULL allowed when ns=0.
+ * @param[in] ns Number of source entries; duplicates are allowed.
+ * @param[in] inverse Reverse the NFA and toggle every label's graph direction.
+ *     QS, QF and S are used as supplied; state sets are not swapped.
+ * @param[out] msg Optional buffer of at least LAGRAPH_MSG_LEN bytes, cleared on
+ *     entry; may be NULL.
+ * @return GrB_SUCCESS, or an input, allocation or GraphBLAS error code.
+ *
+ * Reconstruction uses the same inclusive build-time LG_RPQ_PATH_MAX_LENGTH
+ * bound and successful path-count truncation as AllPaths (60000 edges and
+ * 100000 collected paths by default).  If the count cap stops traversal,
+ * minima cover only the collected prefix: shorter paths may remain unseen.
+ * Final filtering may return fewer than the cap, without resuming traversal.
+ * Results retain original label
+ * indices in query traversal order.  Equal graph paths are returned once.
+ * Inputs remain unchanged and all query workspace is released before return.
+ */
+LAGRAPHX_PUBLIC
+int LAGraph_2RpqPath_AllShortestPaths
+(
+    LAGraph_RpqPath **paths,
+    size_t *path_count,
+    LAGraph_Graph *R,
+    const bool *inverse_labels,
+    size_t nl,
+    const GrB_Index *QS,
+    size_t nqs,
+    const GrB_Index *QF,
+    size_t nqf,
+    LAGraph_Graph *G,
+    const GrB_Index *S,
+    size_t ns,
+    bool inverse,
+    char *msg
+) ;
+
+
+/**
+ * @brief Release an array returned by any LAGraph_2RpqPath query function.
+ * @param[in,out] paths Address of the owned array.  All element buffers and
+ *     the array are freed, and *paths becomes NULL.  A NULL address or an
+ *     already NULL array is accepted.
+ * @param[in] path_count Number of initialized paths; ignored if the array is
+ *     NULL.  The caller's count variable is not modified.
+ * @param[out] msg Optional buffer of at least LAGRAPH_MSG_LEN bytes, cleared
+ *     on entry; may be NULL.
+ * @return GrB_SUCCESS.
+ */
+LAGRAPHX_PUBLIC
+int LAGraph_2RpqPath_FreePaths
+(
+    LAGraph_RpqPath **paths,
+    size_t path_count,
+    char *msg
+) ;
+
+//****************************************************************************
 #define QUICK_PATH_LENGTH 20
 #define QUICK_PATH_COUNT 1
 

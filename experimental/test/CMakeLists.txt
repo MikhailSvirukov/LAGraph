@@ -123,3 +123,16 @@ foreach( testsourcefile ${TEST_SOURCES} )
     endif ( )
 endforeach( testsourcefile ${TEST_SOURCES} )
 
+# The cyclic RPQ cases must terminate when P reaches a fixed point, even
+# though reconstruction can enumerate repeated vertices and edges.
+set_tests_properties ( LAGraphX_2RpqPath PROPERTIES TIMEOUT 60 )
+
+# Test small configurable bounds through the public API without enumerating
+# 60001 cyclic paths. Compile the implementation into this executable so its
+# test-specific constants do not change the normal LAGraphX library.
+target_sources ( test_2RpqPath_limits PRIVATE
+    ${PROJECT_SOURCE_DIR}/experimental/algorithm/LAGraph_2RpqPath.c )
+target_compile_definitions ( test_2RpqPath_limits PRIVATE
+    LGX_LIBRARY LG_RPQ_PATH_MAX_LENGTH=8 LG_RPQ_PATH_MAX_COUNT=4 )
+set_tests_properties ( LAGraphX_2RpqPath_limits PROPERTIES TIMEOUT 60 )
+
