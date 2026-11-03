@@ -10,7 +10,7 @@ import sys
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("queries", type=Path,
-                        help="numbered query folders with meta.txt, or flat <number>_meta.txt files")
+                        help="directory of numbered query folders containing meta.txt")
     parser.add_argument("matrices", nargs="+",
                         help="matrix directory, individual <label>.txt/.mtx files, or <label>=<path>")
     parser.add_argument("--semantics", choices=("all", "simple", "trails", "shortest"),
@@ -33,13 +33,8 @@ def main():
     queries = sorted((p for p in args.queries.iterdir()
                       if p.is_dir() and p.name.isdecimal() and (p / "meta.txt").is_file()),
                      key=lambda p: int(p.name))
-    layout = "folders" if queries else "flat"
-    if layout == "flat":
-        queries = sorted((p for p in args.queries.glob("*_meta.txt")
-                          if p.is_file() and p.name[:-9].isdecimal()),
-                         key=lambda p: int(p.name[:-9]))
     if not queries:
-        parser.error("no numbered query folders or <number>_meta.txt files")
+        parser.error("no numbered query folders containing meta.txt")
     inputs = []
     for value in args.matrices:
         path = Path(value)
@@ -63,32 +58,17 @@ def main():
             parser.error(f"expected a matrix directory, <label>.txt/.mtx, or <label>=<existing-file>: {value}")
         if label in matrices:
             parser.error(f"duplicate graph label: {label}")
-        if layout == "folders":
-            if not label.isdecimal() or int(label) < 1 or int(label) > 2**63 - 1:
-                parser.error(f"folder format requires positive integer graph labels: {label}")
-            label = str(int(label))
-            if label in matrices:
-                parser.error(f"duplicate graph label: {label}")
+        if not label.isdecimal() or int(label) < 1 or int(label) > 2**63 - 1:
+            parser.error(f"expected a positive integer graph label: {label}")
+        label = str(int(label))
+        if label in matrices:
+            parser.error(f"duplicate graph label: {label}")
         matrices[label] = path
     command = [str(driver.resolve()), args.semantics, str(args.warmup),
-               str(args.iterations), layout, str(len(matrices))]
+               str(args.iterations), str(len(matrices))]
     for label, path in matrices.items():
         command.extend([label, str(path.resolve())])
-    for meta in queries:
-        if layout == "folders":
-            command.append(str(meta.resolve()))
-            continue
-        number = meta.name[:-9]
-        sources = meta.with_name(f"{number}_sources.txt")
-        if not sources.is_file():
-            parser.error(f"missing sources file: {sources}")
-        nfa = {p.name[len(number) + 1:-4]: p
-               for p in args.queries.glob(f"{number}_*.mtx") if p.is_file()}
-        if not nfa:
-            parser.error(f"no NFA matrices for query {number}")
-        if missing := nfa.keys() - matrices.keys():
-            parser.error(f"query {number}: missing graph labels: {', '.join(sorted(missing))}")
-        command.append(str(meta.with_name(number).resolve()))
+    command.extend(str(directory.resolve()) for directory in queries)
     return subprocess.run(command, check=False).returncode
 
 
