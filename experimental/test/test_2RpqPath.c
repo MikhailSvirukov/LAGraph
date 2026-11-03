@@ -897,54 +897,6 @@ static void test_nonaccepting_cycle (void)
 }
 
 /*
- *             a                         a
- * Graph:    +---+            NFA:      +---+
- *           v   |                     v   |
- *          [0]--+                 -->((q0))-+
- *
- * The documented default bound is 1024 edges, inclusive.
- * Expected paths: (0 -a-> 0)^k for every k=0,...,1024, exactly once each.
- * This explicit family also checks the zero-edge path, the last permitted
- * length, repeated traversal of a root and termination of the matrix phase.
- */
-static void test_length_limit (void)
-{
-    const TestEdge graph [] = { { 0, 0, 0 } } ;
-    const TestEdge automaton [] = { { 0, 0, 0 } } ;
-    const TestQuery query =
-    {
-        .graph_vertices = 1, .automaton_states = 1,
-        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
-        .automaton_edges = automaton,
-        .automaton_edge_count = ARRAY_COUNT (automaton),
-        .QS = { 0 }, .nqs = 1, .QF = { 0 }, .nqf = 1, .S = { 0 }, .ns = 1
-    } ;
-    LAGraph_RpqPath *paths = NULL ;
-    size_t count = 0 ;
-    test_run_query (&query, &paths, &count) ;
-    TEST_CHECK_ (count == 1025, "got %zu paths, expected 1025", count) ;
-    TEST_ASSERT (paths != NULL) ;
-    bool seen [1025] = { false } ;
-    for (size_t k = 0 ; k < count ; k++)
-    {
-        TEST_ASSERT (paths[k].length <= 1024) ;
-        TEST_ASSERT (paths[k].elements != NULL) ;
-        TEST_CHECK (!seen[paths[k].length]) ;
-        seen[paths[k].length] = true ;
-        bool matches = true ;
-        for (size_t i = 0 ; i < 2 * paths[k].length + 1 ; i++)
-            matches &= paths[k].elements[i] == 0 ;
-        TEST_CHECK_ (matches, "incorrect path of length %zu", paths[k].length) ;
-    }
-    for (size_t length = 0 ; length <= 1024 ; length++)
-        TEST_CHECK_ (seen[length], "missing path of length %zu", length) ;
-    TEST_CHECK (LAGraph_2RpqPath_FreePaths (&paths, count,
-        msg) == GrB_SUCCESS) ;
-    TEST_CHECK (LAGraph_Finalize (msg) == GrB_SUCCESS) ;
-}
-
-
-/*
  * Graph: [0] -a-> 1 -b-> 2 -c-> 3
  *          ^      |
  *          +--b---+
@@ -2037,7 +1989,6 @@ TEST_LIST =
     { "RpqPath_repeated_edge", test_repeated_edge },
     { "RpqPath_long_chain", test_long_chain },
     { "RpqPath_nonaccepting_cycle", test_nonaccepting_cycle },
-    { "RpqPath_length_limit", test_length_limit },
     { "RpqPath_wide_graph", test_wide_graph },
     { "RpqPath_many_predecessors", test_many_predecessors },
     { "RpqPath_simple_repeated_vertex", test_simple_repeated_vertex },

@@ -859,6 +859,8 @@ int LAGraph_2RegularPathQuery   // nodes reachable from the starting by the
 );
 //****************************************************************************
 // Predecessor-based RPQ path enumeration.
+// Inputs must satisfy the documented preconditions; these functions perform
+// no input verification. The standalone benchmark supports Python --verify.
 
 /** One owned graph path: length edges and 2*length+1 integers in elements,
  *  ordered vertex, label, vertex, ..., label, vertex.  A zero-edge path stores
@@ -899,7 +901,9 @@ LAGraph_RpqPath ;
  * @return GrB_SUCCESS, or an input, allocation or GraphBLAS error code.
  *
  * Repeated vertices and edges are allowed.  Reconstruction is bounded by the
- * build-time LG_RPQ_PATH_MAX_LENGTH setting (1024 edges by default), inclusive.
+ * build-time LG_RPQ_PATH_MAX_LENGTH setting (60000 edges by default), inclusive.
+ * Reconstruction stops after LG_RPQ_PATH_MAX_COUNT distinct paths have been
+ * saved (100000 by default), returning GrB_SUCCESS with the collected prefix.
  * Zero-edge paths are included when a source has an initial accepting state.
  * Result sequences follow the query's traversal direction and retain original
  * label indices.  Equal graph paths from different NFA runs are emitted once.
@@ -954,7 +958,8 @@ int LAGraph_2RpqPath_AllPaths
  * @return GrB_SUCCESS, or an input, allocation or GraphBLAS error code.
  *
  * Reconstruction uses the same inclusive build-time LG_RPQ_PATH_MAX_LENGTH
- * bound as AllPaths (1024 edges by default).  Results retain original label
+ * bound and successful path-count truncation as AllPaths (60000 edges and
+ * 100000 collected paths by default).  Results retain original label
  * indices in query traversal order.  Equal graph paths are returned once.
  * Inputs remain unchanged and all query workspace is released before return.
  */
@@ -1008,7 +1013,8 @@ int LAGraph_2RpqPath_AllSimple
  * @return GrB_SUCCESS, or an input, allocation or GraphBLAS error code.
  *
  * Reconstruction uses the same inclusive build-time LG_RPQ_PATH_MAX_LENGTH
- * bound as AllPaths (1024 edges by default).  Results retain original label
+ * bound and successful path-count truncation as AllPaths (60000 edges and
+ * 100000 collected paths by default).  Results retain original label
  * indices in query traversal order.  Equal graph paths are returned once.
  * Inputs remain unchanged and all query workspace is released before return.
  */
@@ -1065,7 +1071,11 @@ int LAGraph_2RpqPath_AllTrails
  * @return GrB_SUCCESS, or an input, allocation or GraphBLAS error code.
  *
  * Reconstruction uses the same inclusive build-time LG_RPQ_PATH_MAX_LENGTH
- * bound as AllPaths (1024 edges by default).  Results retain original label
+ * bound and successful path-count truncation as AllPaths (60000 edges and
+ * 100000 collected paths by default).  If the count cap stops traversal,
+ * minima cover only the collected prefix: shorter paths may remain unseen.
+ * Final filtering may return fewer than the cap, without resuming traversal.
+ * Results retain original label
  * indices in query traversal order.  Equal graph paths are returned once.
  * Inputs remain unchanged and all query workspace is released before return.
  */

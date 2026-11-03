@@ -27,11 +27,8 @@
 #include "LAGraphX.h"
 #include <stdatomic.h>
 
-// Set to 0 for builds whose callers supply already validated inputs.
-// Allocation and GraphBLAS operation errors are still handled in those builds.
-#ifndef LG_RPQ_PATH_VALIDATE_INPUT
-#define LG_RPQ_PATH_VALIDATE_INPUT 1
-#endif
+// Input correctness is the caller's responsibility.  The benchmark launcher
+// can verify input files in Python before calling this algorithm.
 
 // Maximum reconstructed path length, in edges, including for all-paths queries
 // whose result could otherwise be infinite.  This does not limit the matrix
@@ -1239,125 +1236,6 @@ static void LG_RpqPath_Free (LG_RpqPath_Workspace **workspace)
     LAGraph_Free ((void **) workspace, NULL) ;
 }
 
-#if LG_RPQ_PATH_VALIDATE_INPUT
-/**
- * @brief Validate all initialization inputs without allocating a workspace.
- *
- * @param[in] workspace Address intended to receive the workspace in Init;
- *     must not be NULL.  This function does not read or modify *workspace.
- * @param[in] R NFA decomposition, an array of nl graph handles.  R[a] may be
- *     NULL for an absent label; at least one adjacency matrix must exist.
- * @param[in] inverse_labels Non-NULL array of nl flags; true means the label
- *     traverses graph edges in reverse.  Only the pointer is checked here.
- * @param[in] nl Number of label slots shared by G, R and inverse_labels;
- *     must be positive.
- * @param[in] QS Array of nqs initial NFA state indices; NULL allowed if nqs=0.
- * @param[in] nqs Number of entries in QS; duplicates are allowed.
- * @param[in] QF Array of nqf accepting NFA state indices; NULL allowed if nqf=0.
- * @param[in] nqf Number of entries in QF; duplicates are allowed.
- * @param[in] G Graph decomposition, an array of nl graph handles.  G[a] may be
- *     NULL for an absent label; at least one adjacency matrix must exist.
- * @param[in] S Array of ns source vertex indices; NULL allowed if ns=0.
- * @param[in] ns Number of entries in S; duplicates are allowed.
- * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes;
- *     may be NULL.
- *
- * All indices are zero-based.  Each decomposition must contain square
- * matrices of one common size; the graph and NFA sizes may differ.
- * The caller must supply arrays with the stated lengths: this function cannot
- * discover the actual allocation sizes behind the pointers.
- *
- * @return GrB_SUCCESS on valid input, otherwise a LAGraph/GraphBLAS error code.
- * @note Compiled only when LG_RPQ_PATH_VALIDATE_INPUT is enabled.  This helper
- *     owns no memory; the caller handles any workspace cleanup.
- */
-static int LG_RpqPath_ValidateInput
-(
-    LG_RpqPath_Workspace **workspace,
-    LAGraph_Graph *R,
-    const bool *inverse_labels,
-    size_t nl,
-    const GrB_Index *QS,
-    size_t nqs,
-    const GrB_Index *QF,
-    size_t nqf,
-    LAGraph_Graph *G,
-    const GrB_Index *S,
-    size_t ns,
-    char *msg
-)
-{
-    LG_ASSERT (workspace != NULL, GrB_NULL_POINTER) ;
-    LG_ASSERT (G != NULL && R != NULL, GrB_NULL_POINTER) ;
-    LG_ASSERT (inverse_labels != NULL, GrB_NULL_POINTER) ;
-    // Empty sets are valid; a NULL array is allowed only for a zero count.
-    LG_ASSERT (S != NULL || ns == 0, GrB_NULL_POINTER) ;
-    LG_ASSERT (QS != NULL || nqs == 0, GrB_NULL_POINTER) ;
-    LG_ASSERT (QF != NULL || nqf == 0, GrB_NULL_POINTER) ;
-    LG_ASSERT_MSG (nl > 0, GrB_INVALID_VALUE,
-        "at least one label slot is required to determine graph dimensions") ;
-
-    GrB_Index ng = 0, nr = 0 ;
-    bool have_graph = false, have_nfa = false ;
-
-    // Graph matrices must agree with each other; their size need not equal
-    // the NFA size.  Missing labels are allowed on either side independently.
-    for (size_t a = 0 ; a < nl ; a++)
-    {
-        if (G[a] == NULL) continue ;
-        LG_TRY (LAGraph_CheckGraph (G[a], msg)) ;
-        GrB_Index rows = 0, cols = 0 ;
-        GRB_TRY (GrB_Matrix_nrows (&rows, G[a]->A)) ;
-        GRB_TRY (GrB_Matrix_ncols (&cols, G[a]->A)) ;
-        if (!have_graph)
-        {
-            ng = rows ;
-            have_graph = true ;
-        }
-        LG_ASSERT_MSGF (rows == ng && cols == ng, GrB_DIMENSION_MISMATCH,
-            "graph decomposition matrices must be square and have the same "
-            "dimensions (label %zu)", a) ;
-    }
-    LG_ASSERT_MSG (have_graph, GrB_INVALID_VALUE,
-        "graph decomposition must contain at least one adjacency matrix") ;
-
-    for (size_t a = 0 ; a < nl ; a++)
-    {
-        if (R[a] == NULL) continue ;
-        LG_TRY (LAGraph_CheckGraph (R[a], msg)) ;
-        GrB_Index rows = 0, cols = 0 ;
-        GRB_TRY (GrB_Matrix_nrows (&rows, R[a]->A)) ;
-        GRB_TRY (GrB_Matrix_ncols (&cols, R[a]->A)) ;
-        if (!have_nfa)
-        {
-            nr = rows ;
-            have_nfa = true ;
-        }
-        LG_ASSERT_MSGF (rows == nr && cols == nr, GrB_DIMENSION_MISMATCH,
-            "NFA decomposition matrices must be square and have the same "
-            "dimensions (label %zu)", a) ;
-    }
-    LG_ASSERT_MSG (have_nfa, GrB_INVALID_VALUE,
-        "NFA decomposition must contain at least one adjacency matrix") ;
-
-    for (size_t k = 0 ; k < ns ; k++)
-    {
-        LG_ASSERT_MSG (S[k] < ng, GrB_INVALID_INDEX,
-            "invalid graph source vertex") ;
-    }
-    for (size_t k = 0 ; k < nqs ; k++)
-    {
-        LG_ASSERT_MSG (QS[k] < nr, GrB_INVALID_INDEX,
-            "invalid NFA starting state") ;
-    }
-    for (size_t k = 0 ; k < nqf ; k++)
-    {
-        LG_ASSERT_MSG (QF[k] < nr, GrB_INVALID_INDEX,
-            "invalid NFA final state") ;
-    }
-    return (GrB_SUCCESS) ;
-}
-#endif
 
 /**
  * @brief Prepare references to one decomposition and determine its dimension.
@@ -1375,8 +1253,7 @@ static int LG_RpqPath_ValidateInput
  *
  * @return GrB_SUCCESS on success, otherwise a GraphBLAS error code.  Outputs
  *     may be partially filled on error; the caller retains their ownership.
- * @pre Inputs satisfy ValidateInput's requirements.  This helper performs
- *     necessary preparation even when input validation is disabled.
+ * @pre The caller supplies correctly sized graph/NFA decompositions.
  */
 static int LG_RpqPath_PrepareDecomposition
 (
@@ -1418,32 +1295,21 @@ static int LG_RpqPath_PrepareDecomposition
  * @param[in] inverse_labels Non-NULL array of nl flags.  A true entry reverses
  *     graph traversal for that label, before whole-query inversion is applied.
  * @param[in] nl Positive number of label slots in R, G and inverse_labels.
- * @param[in] QS Array of nqs initial NFA state indices; NULL allowed if nqs=0.
- * @param[in] nqs Number of entries in QS; duplicates are allowed.
- * @param[in] QF Array of nqf accepting NFA state indices; NULL allowed if nqf=0.
- *     These indices are validated but not retained; pass them to Traverse.
- * @param[in] nqf Number of entries in QF; duplicates are allowed.
  * @param[in] G Graph decomposition: nl graph handles indexed by label.
  *     Individual entries may be NULL; at least one adjacency matrix must exist.
- * @param[in] S Array of ns source vertex indices; NULL allowed if ns=0.
- * @param[in] ns Number of entries in S; duplicates are allowed.
  * @param[in] inverse Reverse the whole query: traverse the NFA backwards and
  *     flip every label's graph direction (inverse XOR inverse_labels[a]).
- *     QS and QF are used as supplied; this function does not swap them.
  * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes;
  *     may be NULL.  Cleared on entry.
  *
  * All indices are zero-based.  Empty source/start/final sets are valid.
  * Input matrices are borrowed and must remain alive while the workspace is
  * used.  Matrix handles and direction flags are copied into workspace arrays.
- * QS, QF and S are validated but not retained.  Query uses them again
- * when creating roots and reconstructing accepting paths in Query.
  *
  * @return GrB_SUCCESS on success, otherwise a LAGraph/GraphBLAS error code;
  *     any partially allocated workspace is released before returning an error.
  * @note This function prepares metadata and value types only.  Query owns
  *     roots; Traverse builds P, with H/C created inside its loop.
- *     With LG_RPQ_PATH_VALIDATE_INPUT=0, the caller guarantees valid inputs.
  */
 int LG_RpqPath_Init
 (
@@ -1451,13 +1317,7 @@ int LG_RpqPath_Init
     LAGraph_Graph *R,
     const bool *inverse_labels,
     size_t nl,
-    const GrB_Index *QS,
-    size_t nqs,
-    const GrB_Index *QF,
-    size_t nqf,
     LAGraph_Graph *G,
-    const GrB_Index *S,
-    size_t ns,
     bool inverse,
     char *msg
 )
@@ -1465,19 +1325,7 @@ int LG_RpqPath_Init
     LG_CLEAR_MSG ;
     LG_RpqPath_Workspace *work = NULL ;
 
-    if (workspace != NULL) *workspace = NULL ;
-#if LG_RPQ_PATH_VALIDATE_INPUT
-    LG_TRY (LG_RpqPath_ValidateInput (workspace, R, inverse_labels, nl,
-        QS, nqs, QF, nqf, G, S, ns, msg)) ;
-#else
-    // These sets are only validated here; Traverse receives them directly.
-    (void) QS ;
-    (void) nqs ;
-    (void) QF ;
-    (void) nqf ;
-    (void) S ;
-    (void) ns ;
-#endif
+    *workspace = NULL ;
 
     LG_TRY (LAGraph_Calloc ((void **) &work, 1,
         sizeof (LG_RpqPath_Workspace), msg)) ;
@@ -1506,8 +1354,8 @@ int LG_RpqPath_Init
     }
 
     // H has variable-size values across queries, but one fixed value size
-    // within a query.  Reserve all nr state slots in every value.  Check the
-    // allocation-size arithmetic even when optional input validation is off.
+    // within a query.  Reserve all nr state slots in every value.  Guard the
+    // allocation-size arithmetic before allocating the value type.
     LG_ASSERT_MSG (work->nr <=
         (SIZE_MAX - sizeof (LG_RpqPath_StateSet)) / sizeof (GrB_Index),
         GrB_OUT_OF_MEMORY, "state set size exceeds addressable memory") ;
@@ -2077,13 +1925,8 @@ static int LG_RpqPath_Query
 )
 {
     LG_CLEAR_MSG ;
-    if (paths != NULL) *paths = NULL ;
-    if (path_count != NULL) *path_count = 0 ;
-    if (paths == NULL || path_count == NULL)
-    {
-        LG_ERROR_MSG ("path result addresses must not be NULL") ;
-        return (GrB_NULL_POINTER) ;
-    }
+    *paths = NULL ;
+    *path_count = 0 ;
     LG_RpqPath_Workspace *work = NULL ;
     GrB_Matrix P = NULL, roots = NULL ;
     LG_RpqPath_StoredOwner P_owner =
@@ -2092,7 +1935,7 @@ static int LG_RpqPath_Query
         .error = ATOMIC_VAR_INIT (GrB_SUCCESS)
     } ;
     int info = LG_RpqPath_Init (&work, R, inverse_labels, nl,
-        QS, nqs, QF, nqf, G, S, ns, inverse, msg) ;
+        G, inverse, msg) ;
     if (info != GrB_SUCCESS) goto query_cleanup ;
     info = GrB_Matrix_new (&roots, GrB_BOOL, work->nr, work->ng) ;
     if (info != GrB_SUCCESS) goto query_cleanup ;
