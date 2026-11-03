@@ -37,10 +37,19 @@
 // whose result could otherwise be infinite.  This does not limit the matrix
 // traversal, which terminates when P stops receiving new predecessor records.
 #ifndef LG_RPQ_PATH_MAX_LENGTH
-#define LG_RPQ_PATH_MAX_LENGTH 1024
+#define LG_RPQ_PATH_MAX_LENGTH 60000
 #endif
 #if LG_RPQ_PATH_MAX_LENGTH < 0
 #error "LG_RPQ_PATH_MAX_LENGTH must be nonnegative"
+#endif
+
+// Stop reconstruction as soon as this many distinct paths have been saved.
+// Return the collected prefix successfully, including for shortest semantics.
+#ifndef LG_RPQ_PATH_MAX_COUNT
+#define LG_RPQ_PATH_MAX_COUNT 100000
+#endif
+#if LG_RPQ_PATH_MAX_COUNT < 1
+#error "LG_RPQ_PATH_MAX_COUNT must be positive"
 #endif
 
 // Working reconstruction-buffer capacity, measured in vertex/label integers.
@@ -916,6 +925,7 @@ static int LG_RpqPath_SavePath
     char *msg
 )
 {
+    if (reconstruction->count >= LG_RPQ_PATH_MAX_COUNT) return (GrB_SUCCESS) ;
     size_t slots = 2 * length + 1 ;
     for (size_t k = 0 ; k < reconstruction->count ; k++)
     {
@@ -1076,6 +1086,7 @@ static int LG_RpqPath_ReconstructCell
     char *msg
 )
 {
+    if (reconstruction->count >= LG_RPQ_PATH_MAX_COUNT) return (GrB_SUCCESS) ;
     if (!should_continue (reconstruction->reverse_path, length,
         reconstruction->reverse_path[0], reconstruction)) return (GrB_SUCCESS) ;
 
@@ -1087,7 +1098,8 @@ static int LG_RpqPath_ReconstructCell
         info = LG_RpqPath_SavePath (reconstruction, length, msg) ;
         if (info != GrB_SUCCESS) return (info) ;
     }
-    if (length >= LG_RPQ_PATH_MAX_LENGTH) return (GrB_SUCCESS) ;
+    if (length >= LG_RPQ_PATH_MAX_LENGTH ||
+        reconstruction->count >= LG_RPQ_PATH_MAX_COUNT) return (GrB_SUCCESS) ;
 
     LG_RpqPath_StoredSet predecessors = { .count = 0, .allocation = NULL } ;
     info = GrB_Matrix_extractElement_UDT (&predecessors, P, state, vertex) ;
@@ -1095,6 +1107,7 @@ static int LG_RpqPath_ReconstructCell
     if (info != GrB_SUCCESS) return (info) ;
     for (size_t k = 0 ; k < predecessors.count ; k++)
     {
+        if (reconstruction->count >= LG_RPQ_PATH_MAX_COUNT) break ;
         const LG_RpqPath_Predecessor *predecessor =
             &predecessors.allocation->records[k] ;
         info = LG_RpqPath_ReservePath (reconstruction, length + 1, msg) ;
@@ -1141,9 +1154,11 @@ static int LG_RpqPath_Process
     *path_count = 0 ;
     LG_RpqPath_Reconstruction reconstruction = { 0 } ;
     int info = GrB_SUCCESS ;
-    for (GrB_Index vertex = 0 ; vertex < ng ; vertex++)
+    for (GrB_Index vertex = 0 ; vertex < ng &&
+         reconstruction.count < LG_RPQ_PATH_MAX_COUNT ; vertex++)
     {
-        for (size_t k = 0 ; k < nqf ; k++)
+        for (size_t k = 0 ; k < nqf &&
+             reconstruction.count < LG_RPQ_PATH_MAX_COUNT ; k++)
         {
             info = LG_RpqPath_ReservePath (&reconstruction, 0, msg) ;
             if (info != GrB_SUCCESS) goto reconstruction_cleanup ;

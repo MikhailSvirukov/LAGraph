@@ -1,99 +1,92 @@
 # RPQ path benchmark
 
-Build the driver:
+Build from the LAGraph repository root (SuiteSparse:GraphBLAS 10.1+ is required;
+10.5.0 is the tested version):
 
 ```bash
-cmake -S . -B build
-cmake --build build --target rpq_paths_demo -j4
+cmake -S . -B build-paths -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build build-paths --target rpq_paths_demo --parallel
 ```
 
-Pass a queries directory and the graph decomposition files:
+For a GraphBLAS build outside the standard search paths, add
+`-DGraphBLAS_DIR=/path/to/GraphBLAS/build` to the configure command.
+The executable is `build-paths/experimental/benchmark/rpq_paths_demo`; CMake builds
+it together with the LAGraph libraries it uses. `main.c` is not involved.
+
+Run the Python launcher with the original query and matrix directories:
 
 ```bash
 python3 experimental/benchmark/rpq_paths_bench.py \
-  /path/to/queries /path/to/graph/a.mtx /path/to/graph/b.mtx \
-  --semantics trails --warmup 1 --iterations 5 --build-dir build
+  wikidata-queries-mm /path/to/wikidata-mm \
+  --semantics trails --warmup 1 --iterations 5 --build-dir build-paths \
+  > results.tsv 2> errors.log
 ```
 
-The input format matches `data/rpq_data` and the loader in
-`experimental/test/test_2Rpq.c`:
+The graph directory is scanned non-recursively for positive numeric filenames
+with `.txt`, `.mtx`, or `.mat` extensions, such as `1000.txt`. Auxiliary files
+such as `edges.txt` and `vertices.txt` are ignored. Individual files and explicit
+mappings such as `141=/path/to/matrix.txt` are also accepted. Duplicate graph
+labels and directories with no matching matrices are errors.
+
+Queries use the original format from `main.c`, without conversion:
 
 ```text
 queries/
-  1_meta.txt
-  1_sources.txt
-  1_a.mtx
-  2_meta.txt
-  2_sources.txt
-  2_a.mtx
-  2_b.mtx
+  1/
+    meta.txt
+    141.txt
+    -62.txt
+    raw.txt
 ```
 
-`<number>_meta.txt` contains two counted lists: initial and final NFA states.
-For example, one initial state (1) and two final states (2 and 3):
+For example, `meta.txt` contains:
 
 ```text
+12 0
 1 1
-2 2 3
+1 3
+2 141 -62
 ```
 
-`<number>_sources.txt` contains whitespace-separated graph source vertices,
-without a count. An empty file means an empty source set. Vertex and state IDs
-are one-based in these files and converted to zero-based API indices.
+The first pair is the source and destination, with one-based vertex IDs and `0`
+meaning unrestricted. Next are counted lists of initial and final NFA states
+(one-based). The last counted list contains signed labels. Each declared NFA
+matrix is named `<signed-label>.txt`. A negative label uses the graph matrix
+for its absolute label with `inverse_labels = true`. `raw.txt` is ignored.
+Queries are processed in numeric order. There are no temporary converted files,
+source-list files, or flat `<number>_meta.txt` inputs.
 
-`<number>_<label>.mtx` is the NFA adjacency matrix for that label. An absent file
-means an absent NFA label (`NULL` in the API). Supply a graph matrix for every
-label used by the queries. Graph matrix filenames define labels by their stems:
-`a.mtx` corresponds to `<number>_a.mtx`. For other filenames, specify the label
-explicitly, for example `a=/path/to/labels_a.mtx`.
+Matrices are read directly by `LAGraph_MMRead`, as in `main.c`. Vertex IDs,
+matrix dimensions and entries are preserved. Storage is set to row-major for
+LAGraph. No padding, resizing, relabeling or transposed-matrix cache is added.
+The algorithm requires square graph matrices with matching dimensions **within
+each query**; NFA label matrices must also agree within a query. Matrices unused
+by a query are not passed to it. Dimension errors are returned by the algorithm.
 
-Graph and NFA files must contain square Matrix Market matrices. Graph matrices
-must share dimensions; NFA matrices must share dimensions within each query.
-Numeric values are cast to Boolean adjacency values. No decomposition or regex
-conversion is performed. Queries are processed in numeric order.
-
-The graph is loaded once. Each NFA and its sources are loaded before timing.
-One wall-clock measurement surrounds the complete public algorithm call,
-including predecessor matrix construction and path reconstruction. Loading
-inputs and freeing returned paths are outside the measured interval. The
-reported count is the returned `path_count`, without additional processing.
-`inverse` and all `inverse_labels` flags are false.
+A fixed source runs forward. A fixed destination with a free source runs
+backward from that destination, swapping the initial/final NFA state sets and
+setting `inverse = true`, as in `main.c`. Two free endpoints use all graph
+vertices as sources. Two fixed endpoints produce an explicit error: the public
+API has no target filter. Results are not filtered by the driver. With
+`shortest`, minima are per endpoint in the chosen traversal direction; for a
+backward query, these endpoints are the original sources.
 
 `--semantics` accepts `all` (default), `simple`, `trails`, or `shortest`.
-The algorithm's reconstruction depth and arena limits apply.
+`--warmup N` runs N unreported full-batch passes (default 0).
+`--iterations N` runs N measured full-batch passes (default 1, positive).
+All warmup passes finish before measured passes begin. Each query's reported
+time is the arithmetic mean of its measured calls, excluding warmup.
 
-`--warmup N` runs N complete unreported passes over the query batch (default 0).
-`--iterations N` runs N measured complete passes (default 1, must be positive).
-All warmup passes finish before measurements start. For example, with queries
-1 and 2, `--warmup 1 --iterations 2` runs warmup [1, 2], measured [1, 2],
-measured [1, 2]. Each output row reports the arithmetic mean of that query's
-measured times and its path count. Warmup timings are discarded.
+Graph matrices are loaded once for the entire process. Each invocation loads
+its NFA and creates a fresh algorithm workspace; the query's inputs, workspace
+and returned paths are released before the next invocation. File loading and
+freeing the returned paths are outside the timed public API call. The
+algorithm's path-length bound applies (60000 edges by default). Reconstruction
+stops successfully after collecting 100000 distinct paths by default. With
+`shortest`, this can miss a shorter path found later in traversal; its final
+filter only compares the collected prefix, so the returned count may be lower.
 
-All passes share one process, one GraphBLAS initialization and the loaded graph.
-Each query invocation reloads its NFA and sources, creates a fresh algorithm
-workspace, and releases the workspace, query inputs and returned paths before
-the next invocation. There is no reuse of predecessor matrices or reconstruction
-state. If any invocation fails, its query row is omitted and the exit status is
-nonzero; other queries and passes still run. Changing path counts between
-measured passes is also reported as an error.
-
-For the repository examples, queries 1–4 use `a.mtx` and `b.mtx`, while queries
-5–6 use a different graph (`labels_a.mtx` and `labels_b.mtx`). Put the desired
-query files in a separate directory for each graph. For example:
-
-```bash
-mkdir -p /tmp/rpq-queries-1-4
-cp data/rpq_data/[1-4]_*.mtx data/rpq_data/[1-4]_meta.txt \
-  data/rpq_data/[1-4]_sources.txt /tmp/rpq-queries-1-4/
-python3 experimental/benchmark/rpq_paths_bench.py \
-  /tmp/rpq-queries-1-4 data/rpq_data/a.mtx data/rpq_data/b.mtx \
-  --semantics trails --build-dir build
-```
-
-For queries 5–6, use graph arguments
-`a=data/rpq_data/labels_a.mtx b=data/rpq_data/labels_b.mtx`.
-
-Output is tab-separated, one successful query per row:
+Output is TSV on stdout, one row per successful query:
 
 ```text
 query   time_seconds   paths
@@ -101,6 +94,12 @@ query   time_seconds   paths
 2       0.000456789    3
 ```
 
-Redirect stdout to save the table. Input discovery errors stop the launcher.
-Driver errors go to stderr, subsequent queries still run, and the script returns
-a nonzero exit status if any query failed.
+Errors go to stderr. A query with any failed invocation is omitted from the
+table; later queries and passes still run, and the process returns nonzero.
+Changing path counts between measured passes are also reported as an error.
+
+To identify a query that crashes before the final table is printed, set
+`LAGRAPH_RPQ_TRACE=1` when running the launcher. The driver writes and flushes
+the query number and pass to stderr immediately before each invocation. For
+example, prefix the launch command with `LAGRAPH_RPQ_TRACE=1` and use
+`2> trace.log`; the last trace line identifies the active query.

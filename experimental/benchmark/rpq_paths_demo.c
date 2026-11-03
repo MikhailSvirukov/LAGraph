@@ -258,6 +258,7 @@ int main (int argc, char **argv)
     GraphLabel *graph = NULL ;
     BenchmarkResult *results = NULL ;
     bool failed = false ;
+    bool trace_queries = getenv ("LAGRAPH_RPQ_TRACE") != NULL ;
     int info = LAGraph_Init (msg) ;
     if (info != GrB_SUCCESS)
     {
@@ -290,6 +291,12 @@ int main (int argc, char **argv)
                 double seconds = 0 ;
                 size_t count = 0 ;
                 msg[0] = '\0' ;
+                if (trace_queries)
+                {
+                    fprintf (stderr, "query %s: %s pass %ld\n", number,
+                        phase == 0 ? "warmup" : "measured", pass + 1) ;
+                    fflush (stderr) ;
+                }
                 int query_info = run_query (prefix, graph, (size_t) n, query,
                     &seconds, &count, msg) ;
                 if (query_info != GrB_SUCCESS)
