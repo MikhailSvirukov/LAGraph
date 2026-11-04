@@ -1877,6 +1877,29 @@ static int LG_RpqPath_Query
     LG_CLEAR_MSG ;
     *paths = NULL ;
     *path_count = 0 ;
+    // Optional per-query timings. The caller supplies the batch query ID;
+    // the algorithm never substitutes a call counter for that ID. Opening,
+    // writing and closing the file are outside both measured stages.
+    FILE *timings = NULL ;
+    const char *timings_path = getenv ("LAGRAPH_RPQ_STAGE_TIMINGS") ;
+    const char *query_id = NULL ;
+    double matrix_seconds = -1, reconstruction_seconds = -1, begin = 0 ;
+    if (timings_path != NULL && timings_path[0] != '\0')
+    {
+        query_id = getenv ("LAGRAPH_RPQ_QUERY_ID") ;
+        if (query_id == NULL || query_id[0] == '\0' ||
+            strpbrk (query_id, "\t\r\n") != NULL)
+        {
+            LG_ERROR_MSG ("stage timings require a nonempty LAGRAPH_RPQ_QUERY_ID without tabs/newlines") ;
+            return (GrB_INVALID_VALUE) ;
+        }
+        timings = fopen (timings_path, "a") ;
+        if (timings == NULL)
+        {
+            LG_ERROR_MSG ("could not open stage timings file: %s", timings_path) ;
+            return (LAGRAPH_IO_ERROR) ;
+        }
+    }
     LG_RpqPath_Workspace *work = NULL ;
     GrB_Matrix P = NULL, roots = NULL ;
     LG_RpqPath_StoredOwner P_owner =
@@ -1897,13 +1920,18 @@ static int LG_RpqPath_Query
     }
 
     // Stage 1: finish the matrix algorithm, regardless of path semantics.
+    if (timings != NULL) begin = LAGraph_WallClockTime ( ) ;
     info = LG_RpqPath_Traverse (&P, &P_owner, work, roots, msg) ;
+    if (timings != NULL) matrix_seconds = LAGraph_WallClockTime ( ) - begin ;
     if (info != GrB_SUCCESS) goto query_cleanup ;
 
     // Stage 2: the shared reconstruction only reads P and roots.  Their
     // storage remains live until reconstruction and result filtering finish.
+    if (timings != NULL) begin = LAGraph_WallClockTime ( ) ;
     info = LG_RpqPath_Process (paths, path_count, P, roots, QF, nqf,
         work->ng, should_continue, msg) ;
+    if (timings != NULL)
+        reconstruction_seconds = LAGraph_WallClockTime ( ) - begin ;
 
 query_cleanup:
     GrB_free (&P) ;
@@ -1913,6 +1941,27 @@ query_cleanup:
     if (info != GrB_SUCCESS && (msg == NULL || msg[0] == '\0'))
     {
         LG_ERROR_MSG ("RPQ query failed: info: %d", info) ;
+    }
+    if (timings != NULL)
+    {
+        // Empty fields distinguish stages never reached from fast/empty work.
+        int written ;
+        if (matrix_seconds < 0)
+            written = fprintf (timings, "%s\t\t\n", query_id) ;
+        else if (reconstruction_seconds < 0)
+            written = fprintf (timings, "%s\t%.9f\t\n", query_id, matrix_seconds) ;
+        else
+            written = fprintf (timings, "%s\t%.9f\t%.9f\n", query_id,
+                matrix_seconds, reconstruction_seconds) ;
+        int closed = fclose (timings) ;  // flush each row before returning
+        if ((written < 0 || closed != 0) && info == GrB_SUCCESS)
+        {
+            // Preserve the API's no-partial-result contract on an I/O error.
+            LG_RpqPath_FreePaths (paths, *path_count) ;
+            *path_count = 0 ;
+            LG_ERROR_MSG ("could not write stage timings file: %s", timings_path) ;
+            info = LAGRAPH_IO_ERROR ;
+        }
     }
     return (info) ;
 }

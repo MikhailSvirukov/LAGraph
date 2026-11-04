@@ -3,6 +3,11 @@
 //------------------------------------------------------------------------------
 // SPDX-License-Identifier: BSD-2-Clause
 
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#include <unistd.h>
+#endif
+
 #include <LAGraph_test.h>
 #include <LAGraphX.h>
 
@@ -1969,8 +1974,99 @@ static void test_many_predecessors (void)
     test_check_query (&query) ;
 }
 
+#ifndef _WIN32
+// Exercise real queries: timings must be opt-in, retain caller IDs, append
+// immediately in every mode, and surface file errors without leaking results.
+static void test_stage_timings (void)
+{
+    char filename [] = "/tmp/LAGraph-stage-times-XXXXXX" ;
+    int fd = mkstemp (filename) ;
+    TEST_ASSERT (fd >= 0) ;
+    close (fd) ;
+    unsetenv ("LAGRAPH_RPQ_STAGE_TIMINGS") ;
+    unsetenv ("LAGRAPH_RPQ_QUERY_ID") ;
+    TEST_ASSERT (LAGraph_Init (msg) == GrB_SUCCESS) ;
+    const TestEdge edges [] = { { 0, 0, 1 } } ;
+    LAGraph_Graph G [TEST_LABELS], R [TEST_LABELS] ;
+    test_build_decomposition (G, 2, edges, 1) ;
+    test_build_decomposition (R, 2, edges, 1) ;
+    const bool inverse_labels [TEST_LABELS] = { false } ;
+    const GrB_Index QS [] = { 0 }, QF [] = { 1 }, S [] = { 0 } ;
+    LAGraph_RpqPath *paths = NULL ;
+    size_t count = 0 ;
+    TestQueryFunction modes [] = { LAGraph_2RpqPath_AllPaths,
+        LAGraph_2RpqPath_AllSimple, LAGraph_2RpqPath_AllTrails,
+        LAGraph_2RpqPath_AllShortestPaths } ;
+#define RUN_MODE(mode) mode (&paths, &count, R, inverse_labels, TEST_LABELS, \
+    QS, 1, QF, 1, G, S, 1, false, msg)
+
+    TEST_ASSERT (RUN_MODE (modes[0]) == GrB_SUCCESS) ;
+    TEST_CHECK (count == 1) ;
+    TEST_ASSERT (LAGraph_2RpqPath_FreePaths (&paths, count, msg) == GrB_SUCCESS) ;
+    FILE *file = fopen (filename, "r") ;
+    TEST_ASSERT (file != NULL) ;
+    TEST_CHECK (fgetc (file) == EOF) ;
+    fclose (file) ;
+
+    TEST_ASSERT (setenv ("LAGRAPH_RPQ_STAGE_TIMINGS", filename, 1) == 0) ;
+    TEST_CHECK (RUN_MODE (modes[0]) == GrB_INVALID_VALUE) ;
+    TEST_CHECK (paths == NULL && count == 0) ;
+    TEST_ASSERT (setenv ("LAGRAPH_RPQ_QUERY_ID", "bad\tid", 1) == 0) ;
+    TEST_CHECK (RUN_MODE (modes[0]) == GrB_INVALID_VALUE) ;
+    TEST_CHECK (paths == NULL && count == 0) ;
+    const char *ids [] = { "17", "17", "42", "single query" } ;
+    for (size_t mode = 0 ; mode < ARRAY_COUNT (modes) ; mode++)
+    {
+        TEST_ASSERT (setenv ("LAGRAPH_RPQ_QUERY_ID", ids[mode], 1) == 0) ;
+        TEST_ASSERT_ (RUN_MODE (modes[mode]) == GrB_SUCCESS, "%s", msg) ;
+        TEST_CHECK (count == 1 && paths != NULL) ;
+        TEST_CHECK (paths[0].length == 1 && paths[0].elements[2] == 1) ;
+        TEST_ASSERT (LAGraph_2RpqPath_FreePaths (&paths, count, msg) == GrB_SUCCESS) ;
+        file = fopen (filename, "r") ;
+        TEST_ASSERT (file != NULL) ;
+        for (size_t row = 0 ; row <= mode ; row++)
+        {
+            char id [64], line [256], extra ;
+            double matrix_seconds, reconstruction_seconds ;
+            TEST_ASSERT (fgets (line, sizeof (line), file) != NULL) ;
+            TEST_ASSERT (sscanf (line, "%63[^\t]\t%lf\t%lf %c", id,
+                &matrix_seconds, &reconstruction_seconds, &extra) == 3) ;
+            TEST_CHECK (strcmp (id, ids[row]) == 0) ;
+            TEST_CHECK (isfinite (matrix_seconds) && matrix_seconds >= 0) ;
+            TEST_CHECK (isfinite (reconstruction_seconds) && reconstruction_seconds >= 0) ;
+        }
+        TEST_CHECK (fgetc (file) == EOF) ;
+        fclose (file) ;
+    }
+    // Opening a directory fails before algorithm execution.
+    TEST_ASSERT (setenv ("LAGRAPH_RPQ_STAGE_TIMINGS", "/tmp", 1) == 0) ;
+    TEST_CHECK (RUN_MODE (modes[0]) == LAGRAPH_IO_ERROR) ;
+    TEST_CHECK (paths == NULL && count == 0) ;
+    // /dev/full opens successfully but rejects the buffered row at fclose.
+    if (access ("/dev/full", W_OK) == 0)
+    {
+        TEST_ASSERT (setenv ("LAGRAPH_RPQ_STAGE_TIMINGS", "/dev/full", 1) == 0) ;
+        TEST_CHECK (RUN_MODE (modes[0]) == LAGRAPH_IO_ERROR) ;
+        TEST_CHECK (paths == NULL && count == 0) ;
+    }
+    unsetenv ("LAGRAPH_RPQ_STAGE_TIMINGS") ;
+    unsetenv ("LAGRAPH_RPQ_QUERY_ID") ;
+    for (size_t label = 0 ; label < TEST_LABELS ; label++)
+    {
+        TEST_CHECK (LAGraph_Delete (&G[label], msg) == GrB_SUCCESS) ;
+        TEST_CHECK (LAGraph_Delete (&R[label], msg) == GrB_SUCCESS) ;
+    }
+    TEST_CHECK (LAGraph_Finalize (msg) == GrB_SUCCESS) ;
+    TEST_CHECK (unlink (filename) == 0) ;
+#undef RUN_MODE
+}
+#endif
+
 TEST_LIST =
 {
+#ifndef _WIN32
+    { "RpqPath_stage_timings", test_stage_timings },
+#endif
     { "RpqPath_chain", test_chain },
     { "RpqPath_branching", test_branching },
     { "RpqPath_unequal_branches", test_unequal_branches },

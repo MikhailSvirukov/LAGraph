@@ -861,6 +861,21 @@ int LAGraph_2RegularPathQuery   // nodes reachable from the starting by the
 // Predecessor-based RPQ path enumeration.
 // Inputs must satisfy the documented preconditions; these functions perform
 // no input verification. The standalone benchmark supports Python --verify.
+//
+// Optional stage timing for all four query modes:
+// Set LAGRAPH_RPQ_STAGE_TIMINGS to a file path and LAGRAPH_RPQ_QUERY_ID to the
+// current batch query's ID (nonempty, no tabs/newlines). Each public query call
+// appends and flushes one headerless TSV row:
+//     query_id  matrix_seconds  reconstruction_seconds
+// The timers surround Traverse (building P) and Process (reconstructing and
+// filtering paths) respectively. Workspace/roots setup, final query cleanup
+// and file I/O are outside both timers. A stage not reached has an empty field;
+// a stage that fails reports its elapsed time. File errors return
+// LAGRAPH_IO_ERROR if the query otherwise succeeded; missing/invalid IDs return
+// GrB_INVALID_VALUE before execution. No result is returned on an I/O error.
+// Unset/empty LAGRAPH_RPQ_STAGE_TIMINGS disables timing and file output.
+// Environment settings are process-wide: the caller must serialize changes
+// and query calls, and use a separate output file for each benchmark process.
 
 /** One owned graph path: length edges and 2*length+1 integers in elements,
  *  ordered vertex, label, vertex, ..., label, vertex.  A zero-edge path stores
