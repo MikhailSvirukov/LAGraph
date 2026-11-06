@@ -2014,9 +2014,67 @@ static void test_incremental_predecessor_blocks (void)
     test_check_query (&query) ;
 }
 
+/* A long common prefix grows the path-local tables.  Two sibling branches
+ * then reuse that prefix and endpoint, and duplicate final states revisit the
+ * whole DFS.  Vertex/edge membership must be undone after every branch.
+ */
+static void test_semantics_backtracking (void)
+{
+    enum { prefix = 95, target = 99, length = 98 } ;
+    TestEdge graph [100] ;
+    size_t edges = 0 ;
+    for (GrB_Index k = 0 ; k < prefix ; k++)
+        graph[edges++] = (TestEdge) { k, 0, k + 1 } ;
+    graph[edges++] = (TestEdge) { 95, 0, 96 } ;
+    graph[edges++] = (TestEdge) { 95, 0, 97 } ;
+    graph[edges++] = (TestEdge) { 96, 0, 98 } ;
+    graph[edges++] = (TestEdge) { 97, 0, 98 } ;
+    graph[edges++] = (TestEdge) { 98, 1, target } ;
+    const TestEdge automaton [] = { { 0, 0, 0 }, { 0, 1, 1 } } ;
+    LAGraph_Graph G [TEST_LABELS] = { NULL }, R [TEST_LABELS] = { NULL } ;
+    TEST_ASSERT (LAGraph_Init (msg) == GrB_SUCCESS) ;
+    test_build_decomposition (G, target + 1, graph, edges) ;
+    test_build_decomposition (R, 2, automaton, ARRAY_COUNT (automaton)) ;
+    const GrB_Index QS [] = { 0 }, QF [] = { 1, 1 }, S [] = { 0 } ;
+    const bool inverse_labels [TEST_LABELS] = { false } ;
+    TestQueryFunction modes [] =
+        { LAGraph_2RpqPath_AllSimple, LAGraph_2RpqPath_AllTrails } ;
+    for (size_t mode = 0 ; mode < ARRAY_COUNT (modes) ; mode++)
+    {
+        LAGraph_RpqPath *paths = NULL ;
+        size_t count = 0 ;
+        TEST_ASSERT (modes[mode] (&paths, &count, R, inverse_labels, TEST_LABELS,
+            QS, 1, QF, 2, G, S, 1, false, msg) == GrB_SUCCESS) ;
+        TEST_CHECK (count == 2) ;
+        bool seen [2] = { false } ;
+        for (size_t k = 0 ; k < count ; k++)
+        {
+            TEST_ASSERT (paths[k].length == length) ;
+            const uint64_t *path = paths[k].elements ;
+            for (size_t j = 0 ; j <= prefix ; j++)
+                TEST_CHECK (path[2 * j] == j) ;
+            for (size_t j = 0 ; j < length - 1 ; j++)
+                TEST_CHECK (path[2 * j + 1] == 0) ;
+            TEST_ASSERT (path[192] == 96 || path[192] == 97) ;
+            TEST_CHECK (!seen[path[192] - 96]) ;
+            seen[path[192] - 96] = true ;
+            TEST_CHECK (path[194] == 98 && path[195] == 1 && path[196] == target) ;
+        }
+        TEST_CHECK (seen[0] && seen[1]) ;
+        TEST_CHECK (LAGraph_2RpqPath_FreePaths (&paths, count, msg) == GrB_SUCCESS) ;
+    }
+    for (size_t a = 0 ; a < TEST_LABELS ; a++)
+    {
+        TEST_CHECK (LAGraph_Delete (&G[a], msg) == GrB_SUCCESS) ;
+        TEST_CHECK (LAGraph_Delete (&R[a], msg) == GrB_SUCCESS) ;
+    }
+    TEST_CHECK (LAGraph_Finalize (msg) == GrB_SUCCESS) ;
+}
+
 TEST_LIST =
 {
     { "RpqPath_chain", test_chain },
+    { "RpqPath_semantics_backtracking", test_semantics_backtracking },
     { "RpqPath_branching", test_branching },
     { "RpqPath_unequal_branches", test_unequal_branches },
     { "RpqPath_parallel_labels", test_parallel_labels },
