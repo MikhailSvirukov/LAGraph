@@ -465,7 +465,8 @@ LG_RpqPath_PredecessorContext ;
  * so the emitted records are sorted without a separate sorting pass.
  * Newly acquired blocks are private until the result handle is written.
  * A failed allocation records GrB_OUT_OF_MEMORY in the pool and returns an
- * empty handle; the caller checks the flag after GrB_Matrix_wait on C.
+ * empty handle; the caller checks the flag after all readers finish, before
+ * resetting the temporary pool at the end of the iteration.
  */
 static void LG_RpqPath_CollectPredecessors
 (
@@ -1347,13 +1348,8 @@ int LG_RpqPath_Traverse
             info = GrB_mxm (C, NULL, ops.predecessor_union, label_ops[a].semiring,
                 H, work->A[a], ops.predecessor_product) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
-            info = GrB_Matrix_wait (C, GrB_MATERIALIZE) ;
-            if (info != GrB_SUCCESS) goto iteration_cleanup ;
-            info = atomic_load (&pool.error) ;
-            if (info != GrB_SUCCESS) goto iteration_cleanup ;
         }
 
-        //  TODO: do we need wait after each operation?
         // 3. Compute the new frontier against OLD P, restricting the output
         // to C's structure.  Keep explicit false flags; termination uses OR
         // of the values rather than the number of stored entries.
@@ -1361,7 +1357,10 @@ int LG_RpqPath_Traverse
             ops.has_new_predecessors, C, ops.empty_temporary, P, ops.empty_stored,
             GrB_DESC_RS) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
-        info = GrB_Matrix_wait (next_frontier, GrB_MATERIALIZE) ;
+        // Reduce to a C scalar before updating P.  In SuiteSparse:GraphBLAS
+        // this resolves pending frontier values without a separate wait.
+        info = GrB_Matrix_reduce_BOOL (&frontier_active, NULL,
+            GrB_LOR_MONOID_BOOL, next_frontier, NULL) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
 
         // 4. Update P in place with independent deep copies, including P-only
@@ -1380,9 +1379,6 @@ int LG_RpqPath_Traverse
         atomic_store (&stored_owner.allocations,
             atomic_exchange (&next_stored_owner.allocations, NULL)) ;
         updating_P = false ;
-        info = GrB_Matrix_reduce_BOOL (&frontier_active, NULL,
-            GrB_LOR_MONOID_BOOL, next_frontier, NULL) ;
-        if (info != GrB_SUCCESS) goto iteration_cleanup ;
 
         // Transfer the frontier; cleanup must not free the next input.
         GrB_free (&frontier) ;
@@ -1390,14 +1386,15 @@ int LG_RpqPath_Traverse
         next_frontier = NULL ;
 
 iteration_cleanup:
-        // 6. Finish pending readers before releasing temporary storage.
-        // On failure, preserve the first error and wait for old-P/C readers.
-        if (next_frontier != NULL)
+        // 6. On success, the frontier reduction and P wait have finished all
+        // readers of old P and C.  Only failures need extra cleanup waits.
+        // Preserve the first error and check pool.error before resetting it.
+        if (info != GrB_SUCCESS && next_frontier != NULL)
         {
             int cleanup_info = GrB_Matrix_wait (next_frontier, GrB_MATERIALIZE) ;
             if (info == GrB_SUCCESS) info = cleanup_info ;
         }
-        if (C != NULL)
+        if (info != GrB_SUCCESS && C != NULL)
         {
             int cleanup_info = GrB_Matrix_wait (C, GrB_MATERIALIZE) ;
             if (info == GrB_SUCCESS) info = cleanup_info ;
