@@ -140,13 +140,18 @@ static void test_shortest_early_stop(void)
     TEST_ASSERT(LAGraph_2RpqPath_AllShortestPaths(&paths,&count,R,inverse,3,
         QS,1,QF,2,G,S,1,false,msg) == GrB_SUCCESS);
     TEST_CHECK(count == 4);
+    bool seen[4] = {false,false,false,false};
     for (size_t k = 0; k < count; k++)
     {
         TEST_CHECK(paths[k].length == 2);
         TEST_CHECK(element(&paths[k], 0) == 0 && element(&paths[k], 1) == 0);
-        TEST_CHECK(element(&paths[k], 2) == k + 1);
+        uint64_t middle = element(&paths[k], 2);
+        TEST_ASSERT(middle >= 1 && middle <= 4);
+        TEST_CHECK(!seen[middle - 1]);
+        seen[middle - 1] = true;
         TEST_CHECK(element(&paths[k], 3) == 1 && element(&paths[k], 4) == 5);
     }
+    TEST_CHECK(seen[0] && seen[1] && seen[2] && seen[3]);
     TEST_CHECK(LAGraph_2RpqPath_FreePaths(&paths,count,msg) == GrB_SUCCESS);
     release(G,R);
 }

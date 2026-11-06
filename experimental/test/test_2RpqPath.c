@@ -1878,9 +1878,9 @@ static void test_shortest_no_path (void)
  *          +--a-> 5 --------a--^
  * NFA:  -->q0 -a-> ((q1)) -a-> q1
  *
- * Shortest: vertex 4 is first reconstructed through predecessor 2 (length 3),
- * then predecessor 3 improves its minimum to 2, and predecessor 5 supplies a tie.
- * Discard only the longer path to vertex 4, preserving other destinations.
+ * Shortest: predecessor 2 gives a length-3 route to vertex 4, while
+ * predecessors 3 and 5 supply two length-2 ties.  Cache only the minimum
+ * routes to vertex 4, preserving the other destinations.
  */
 static void test_shortest_late_shorter_and_tie (void)
 {
@@ -2039,9 +2039,9 @@ static void test_incremental_predecessor_blocks (void)
     test_check_query (&query) ;
 }
 
-/* A long common prefix grows the path-local tables.  Two sibling branches
- * then reuse that prefix and endpoint, and duplicate final states revisit the
- * whole DFS.  Vertex/edge membership must be undone after every branch.
+/* A long common prefix grows the membership tables.  Two sibling branches
+ * and duplicate final states reuse its cached paths.  Switching the active
+ * prefix must preserve exact vertex/edge membership after table growth.
  */
 static void test_semantics_backtracking (void)
 {
@@ -2156,9 +2156,34 @@ static void test_memo_branch_context (bool trails)
 static void test_memo_simple_context (void) { test_memo_branch_context (false) ; }
 static void test_memo_trails_context (void) { test_memo_branch_context (true) ; }
 
+/* Two accepting configurations in a billion-column graph: the zero-edge
+ * root and one edge to the last vertex.  Candidate enumeration must depend
+ * on stored entries, not on the numeric graph dimension.
+ */
+static void test_sparse_accepting_targets (void)
+{
+    const GrB_Index n = UINT64_C (1000000000) ;
+    const TestEdge graph [] = { { 0, 0, n - 1 } } ;
+    const TestEdge automaton [] = { { 0, 0, 1 } } ;
+    const ExpectedPath expected [] =
+        { { 0, { 0 } }, { 1, { 0, 0, n - 1 } } } ;
+    const TestQuery query =
+    {
+        .graph_vertices = n, .automaton_states = 2,
+        .graph_edges = graph, .graph_edge_count = ARRAY_COUNT (graph),
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1, .QF = { 0, 1 }, .nqf = 2,
+        .S = { 0 }, .ns = 1,
+        .expected = expected, .expected_count = ARRAY_COUNT (expected)
+    } ;
+    test_check_query (&query) ;
+}
+
 TEST_LIST =
 {
     { "RpqPath_chain", test_chain },
+    { "RpqPath_sparse_accepting_targets", test_sparse_accepting_targets },
     { "RpqPath_memo_shared_prefix", test_memo_shared_prefix },
     { "RpqPath_memo_simple_context", test_memo_simple_context },
     { "RpqPath_memo_trails_context", test_memo_trails_context },
