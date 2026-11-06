@@ -134,6 +134,33 @@ static void test_run_query
     }
 }
 
+// Test-only indexed view; the public representation is a shared prefix chain.
+static uint64_t test_path_element (const LAGraph_RpqPath *path, size_t slot)
+{
+    size_t position = (slot + 1) / 2 ;
+    const LAGraph_RpqPathNode *node = path->tail ;
+    while (node != NULL && node->length > position) node = node->prefix ;
+    TEST_ASSERT (node != NULL && node->length == position) ;
+    return ((slot & 1) ? node->label : node->vertex) ;
+}
+
+static bool test_path_matches
+(
+    const LAGraph_RpqPath *path,
+    const ExpectedPath *expected
+)
+{
+    if (path->length != expected->length) return (false) ;
+    const LAGraph_RpqPathNode *node = path->tail ;
+    for (size_t n = path->length ; ; n--)
+    {
+        if (node == NULL || node->length != n || node->vertex != expected->elements[2*n] ||
+            (n != 0 && node->label != expected->elements[2*n-1])) return (false) ;
+        node = node->prefix ;
+        if (n == 0) return (node == NULL) ;
+    }
+}
+
 /**
  * @brief Compare returned paths with the test's explicit expected set.
  * @param[in] query One graph/NFA fixture and its manually specified paths.
@@ -149,16 +176,14 @@ static void test_check_query (const TestQuery *query)
         "got %zu paths, expected %zu", count, query->expected_count) ;
     TEST_ASSERT ((count == 0) == (paths == NULL)) ;
     for (size_t k = 0 ; k < count ; k++)
-        TEST_ASSERT (paths[k].elements != NULL) ;
+        TEST_ASSERT (paths[k].tail != NULL) ;
     for (size_t j = 0 ; j < query->expected_count ; j++)
     {
         const ExpectedPath *expected = &query->expected[j] ;
         size_t matches = 0 ;
         for (size_t k = 0 ; k < count ; k++)
         {
-            if (paths[k].length == expected->length &&
-                memcmp (paths[k].elements, expected->elements,
-                    (2 * expected->length + 1) * sizeof (uint64_t)) == 0)
+            if (test_path_matches (&paths[k], expected))
                 matches++ ;
         }
         TEST_CHECK_ (matches == 1,
@@ -2050,15 +2075,15 @@ static void test_semantics_backtracking (void)
         for (size_t k = 0 ; k < count ; k++)
         {
             TEST_ASSERT (paths[k].length == length) ;
-            const uint64_t *path = paths[k].elements ;
+            const LAGraph_RpqPath *path = &paths[k] ;
             for (size_t j = 0 ; j <= prefix ; j++)
-                TEST_CHECK (path[2 * j] == j) ;
+                TEST_CHECK (test_path_element (path, 2 * j) == j) ;
             for (size_t j = 0 ; j < length - 1 ; j++)
-                TEST_CHECK (path[2 * j + 1] == 0) ;
-            TEST_ASSERT (path[192] == 96 || path[192] == 97) ;
-            TEST_CHECK (!seen[path[192] - 96]) ;
-            seen[path[192] - 96] = true ;
-            TEST_CHECK (path[194] == 98 && path[195] == 1 && path[196] == target) ;
+                TEST_CHECK (test_path_element (path, 2 * j + 1) == 0) ;
+            TEST_ASSERT (test_path_element (path, 192) == 96 || test_path_element (path, 192) == 97) ;
+            TEST_CHECK (!seen[test_path_element (path, 192) - 96]) ;
+            seen[test_path_element (path, 192) - 96] = true ;
+            TEST_CHECK (test_path_element (path, 194) == 98 && test_path_element (path, 195) == 1 && test_path_element (path, 196) == target) ;
         }
         TEST_CHECK (seen[0] && seen[1]) ;
         TEST_CHECK (LAGraph_2RpqPath_FreePaths (&paths, count, msg) == GrB_SUCCESS) ;
@@ -2071,9 +2096,72 @@ static void test_semantics_backtracking (void)
     TEST_CHECK (LAGraph_Finalize (msg) == GrB_SUCCESS) ;
 }
 
+/* Two result paths own different tails but share the actual q1/vertex1
+ * prefix node.  Inputs/P have already been freed by test_run_query. */
+static void test_memo_shared_prefix (void)
+{
+    const TestEdge graph [] = { {0,0,1}, {1,1,2}, {1,1,3} } ;
+    const TestEdge automaton [] = { {0,0,1}, {1,1,2} } ;
+    const TestQuery query =
+    {
+        .graph_vertices=4, .automaton_states=3,
+        .graph_edges=graph, .graph_edge_count=ARRAY_COUNT(graph),
+        .automaton_edges=automaton, .automaton_edge_count=ARRAY_COUNT(automaton),
+        .QS={0}, .nqs=1, .QF={2}, .nqf=1, .S={0}, .ns=1
+    } ;
+    LAGraph_RpqPath *paths = NULL ;
+    size_t count = 0 ;
+    test_run_query (&query, &paths, &count) ;
+    TEST_ASSERT (count == 2) ;
+    TEST_ASSERT (paths[0].tail != paths[1].tail) ;
+    const LAGraph_RpqPathNode *prefix = paths[0].tail->prefix ;
+    TEST_ASSERT (prefix != NULL && prefix == paths[1].tail->prefix) ;
+    TEST_CHECK (prefix->vertex == 1 && prefix->label == 0 && prefix->length == 1) ;
+    TEST_ASSERT (prefix->prefix != NULL) ;
+    TEST_CHECK (prefix->prefix->vertex == 0 && prefix->prefix->prefix == NULL) ;
+    TEST_CHECK (paths[0].tail->vertex == 2 && paths[1].tail->vertex == 3) ;
+    TEST_CHECK (LAGraph_2RpqPath_FreePaths (&paths, count, msg) == GrB_SUCCESS) ;
+    TEST_CHECK (paths == NULL) ;
+    TEST_CHECK (LAGraph_2RpqPath_FreePaths (&paths, count, msg) == GrB_SUCCESS) ;
+    TEST_CHECK (LAGraph_Finalize (msg) == GrB_SUCCESS) ;
+}
+
+/* q0 accepts a*.  Graph has 0->1, 0->2, 1->2, 2->1.  A nested visit to
+ * vertex2 while vertex1 is forbidden sees only a partial prefix set.  Later,
+ * a complete vertex1 cache contains prefixes incompatible with target2's
+ * live branch.  Both partial-cache fallback and intersection checks matter.
+ */
+static void test_memo_branch_context (bool trails)
+{
+    const TestEdge graph [] = { {0,0,1}, {0,0,2}, {1,0,2}, {2,0,1} } ;
+    const TestEdge automaton [] = { {0,0,0} } ;
+    const ExpectedPath expected [] =
+    {
+        {0,{0}}, {1,{0,0,1}}, {2,{0,0,2,0,1}},
+        {1,{0,0,2}}, {2,{0,0,1,0,2}},
+        {3,{0,0,1,0,2,0,1}}, {3,{0,0,2,0,1,0,2}}
+    } ;
+    const TestQuery query =
+    {
+        .graph_vertices=3, .automaton_states=1,
+        .graph_edges=graph, .graph_edge_count=ARRAY_COUNT(graph),
+        .automaton_edges=automaton, .automaton_edge_count=ARRAY_COUNT(automaton),
+        .QS={0}, .nqs=1, .QF={0}, .nqf=1, .S={0}, .ns=1,
+        .expected=expected, .expected_count=trails ? 7 : 5,
+        .run=trails ? LAGraph_2RpqPath_AllTrails : LAGraph_2RpqPath_AllSimple
+    } ;
+    test_check_query (&query) ;
+}
+
+static void test_memo_simple_context (void) { test_memo_branch_context (false) ; }
+static void test_memo_trails_context (void) { test_memo_branch_context (true) ; }
+
 TEST_LIST =
 {
     { "RpqPath_chain", test_chain },
+    { "RpqPath_memo_shared_prefix", test_memo_shared_prefix },
+    { "RpqPath_memo_simple_context", test_memo_simple_context },
+    { "RpqPath_memo_trails_context", test_memo_trails_context },
     { "RpqPath_semantics_backtracking", test_semantics_backtracking },
     { "RpqPath_branching", test_branching },
     { "RpqPath_unequal_branches", test_unequal_branches },

@@ -1487,43 +1487,278 @@ traversal_cleanup:
 // Stage 2: path reconstruction and semantics
 //------------------------------------------------------------------------------
 
-// One graph path, independent of the accepting run of the NFA.  length counts
-// edges; elements owns exactly 2 * length + 1 integers in traversal order:
-// vertex, label, vertex, ..., label, vertex.  A zero-edge path owns one vertex.
-// The result has no pointers into P, roots, the temporary pool or DFS storage.
+// Result paths share immutable prefix nodes.  One hidden result header owns
+// the node blocks and descriptor array; neither nodes nor prefixes are freed
+// separately.  No node interning is performed between different memo cells.
 typedef LAGraph_RpqPath LG_RpqPath_Path ;
+typedef LAGraph_RpqPathNode LG_RpqPath_Node ;
 
-/**
- * @brief Free the result array and every owned path buffer.
- * @param[in,out] paths Array address; set to NULL.  NULL/already NULL is allowed.
- * @param[in] path_count Initialized entry count; ignored for a NULL array.
- */
-static void LG_RpqPath_FreePaths
-(
-    LG_RpqPath_Path **paths,
-    size_t path_count
-)
+typedef struct LG_RpqPath_PathBlock
 {
-    if (paths == NULL || *paths == NULL) return ;
-    for (size_t k = 0 ; k < path_count ; k++)
-    {
-        LAGraph_Free ((void **) &(*paths)[k].elements, NULL) ;
-    }
-    LAGraph_Free ((void **) paths, NULL) ;
+    struct LG_RpqPath_PathBlock *next ;
+    size_t count ;
+    LG_RpqPath_Node nodes [64] ;
 }
+LG_RpqPath_PathBlock ;
 
-// Only reconstruction owns these buffers.  The recursive calls share the
-// working prefix, while completed results own separate forward-order copies.
-// P and roots are borrowed; no cached cells or memoized paths are stored here.
+typedef struct
+{
+    LG_RpqPath_PathBlock *blocks ;
+    size_t capacity ;
+    LG_RpqPath_Path paths [] ;
+}
+LG_RpqPath_Result ;
+
+typedef struct
+{
+    GrB_Index state, vertex ;
+    const LG_RpqPath_Node **paths ;
+    size_t count, capacity ;
+    bool complete ;
+    size_t budget ;                 // complete for all lengths up to this bound
+}
+LG_RpqPath_MemoCell ;
+
+typedef struct LG_RpqPath_Frame
+{
+    struct LG_RpqPath_Frame *parent ;
+    LG_RpqPath_MemoCell *cell ;
+    size_t label ;                  // edge from this cell to the parent cell
+    size_t *best ;
+}
+LG_RpqPath_Frame ;
+
 typedef struct
 {
     GrB_Matrix P, roots ;
+    LG_RpqPath_Result *result ;
     LG_RpqPath_Path *paths ;
     size_t count ;
-    uint64_t *reverse_path ;         // target, label, predecessor, ..., source
-    size_t capacity ;                // allocated integer slots in reverse_path
+    uint64_t *reverse_path ;
+    size_t capacity ;
+    LG_RpqPath_MemoCell **memo ;      // sparse table, cells remain at stable addresses
+    size_t memo_count, memo_capacity ;
+    LG_RpqPath_Frame *frame ;        // active reconstruction stack
 }
 LG_RpqPath_Reconstruction ;
+
+static void LG_RpqPath_FreePaths (LG_RpqPath_Path **paths, size_t path_count)
+{
+    (void) path_count ;
+    if (paths == NULL || *paths == NULL) return ;
+    LG_RpqPath_Result *result = (LG_RpqPath_Result *)
+        ((char *) *paths - offsetof (LG_RpqPath_Result, paths)) ;
+    LG_RpqPath_PathBlock *block = result->blocks ;
+    while (block != NULL)
+    {
+        LG_RpqPath_PathBlock *next = block->next ;
+        LAGraph_Free ((void **) &block, NULL) ;
+        block = next ;
+    }
+    LAGraph_Free ((void **) &result, NULL) ;
+    *paths = NULL ;
+}
+
+static int LG_RpqPath_ReserveResults
+(
+    LG_RpqPath_Reconstruction *work,
+    size_t needed,
+    char *msg
+)
+{
+    size_t old = work->result == NULL ? 0 : work->result->capacity ;
+    if (needed <= old) return (GrB_SUCCESS) ;
+    size_t capacity = old == 0 ? 16 : old ;
+    const size_t max = (SIZE_MAX - offsetof (LG_RpqPath_Result, paths)) /
+        sizeof (LG_RpqPath_Path) ;
+    if (needed > max) return (GrB_OUT_OF_MEMORY) ;
+    while (capacity < needed)
+        capacity = capacity > max / 2 ? needed : 2 * capacity ;
+    size_t bytes = offsetof (LG_RpqPath_Result, paths) +
+        capacity * sizeof (LG_RpqPath_Path) ;
+    size_t old_bytes = old == 0 ? 0 : offsetof (LG_RpqPath_Result, paths) +
+        old * sizeof (LG_RpqPath_Path) ;
+    int info = LAGraph_Realloc ((void **) &work->result, bytes, old_bytes, 1, msg) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    if (old == 0) work->result->blocks = NULL ;
+    work->result->capacity = capacity ;
+    work->paths = work->result->paths ;
+    return (GrB_SUCCESS) ;
+}
+
+static bool LG_RpqPath_EqualNodes
+(
+    const LG_RpqPath_Node *a,
+    const LG_RpqPath_Node *b
+)
+{
+    if (a == b) return (true) ;
+    if (a == NULL || b == NULL || a->length != b->length) return (false) ;
+    while (a != b)
+    {
+        if (a == NULL || b == NULL || a->vertex != b->vertex ||
+            (a->prefix != NULL && a->label != b->label)) return (false) ;
+        a = a->prefix ;
+        b = b->prefix ;
+    }
+    return (true) ;
+}
+
+static size_t LG_RpqPath_MemoHash (GrB_Index state, GrB_Index vertex)
+{
+    return ((size_t) LG_RpqPath_Hash (LG_RpqPath_Hash (state +
+        UINT64_C (0x9e3779b97f4a7c15)) ^ vertex)) ;
+}
+
+static LG_RpqPath_MemoCell *LG_RpqPath_MemoFind
+(
+    const LG_RpqPath_Reconstruction *work,
+    GrB_Index state, GrB_Index vertex
+)
+{
+    if (work->memo_capacity == 0) return (NULL) ;
+    size_t slot = LG_RpqPath_MemoHash (state, vertex) & (work->memo_capacity - 1) ;
+    while (work->memo[slot] != NULL)
+    {
+        LG_RpqPath_MemoCell *cell = work->memo[slot] ;
+        if (cell->state == state && cell->vertex == vertex) return (cell) ;
+        slot = (slot + 1) & (work->memo_capacity - 1) ;
+    }
+    return (NULL) ;
+}
+
+static int LG_RpqPath_MemoGet
+(
+    LG_RpqPath_Reconstruction *work,
+    GrB_Index state, GrB_Index vertex,
+    LG_RpqPath_MemoCell **cell,
+    char *msg
+)
+{
+    *cell = LG_RpqPath_MemoFind (work, state, vertex) ;
+    if (*cell != NULL) return (GrB_SUCCESS) ;
+    if (work->memo_count >= work->memo_capacity / 2)
+    {
+        if (work->memo_capacity > SIZE_MAX / 2 / sizeof (*work->memo))
+            return (GrB_OUT_OF_MEMORY) ;
+        size_t capacity = work->memo_capacity == 0 ? 16 : 2 * work->memo_capacity ;
+        LG_RpqPath_MemoCell **table = NULL ;
+        int info = LAGraph_Calloc ((void **) &table, capacity, sizeof (*table), msg) ;
+        if (info != GrB_SUCCESS) return (info) ;
+        for (size_t k = 0 ; k < work->memo_capacity ; k++)
+        {
+            LG_RpqPath_MemoCell *old = work->memo[k] ;
+            if (old == NULL) continue ;
+            size_t slot = LG_RpqPath_MemoHash (old->state, old->vertex) & (capacity - 1) ;
+            while (table[slot] != NULL) slot = (slot + 1) & (capacity - 1) ;
+            table[slot] = old ;
+        }
+        LAGraph_Free ((void **) &work->memo, NULL) ;
+        work->memo = table ;
+        work->memo_capacity = capacity ;
+    }
+    size_t slot = LG_RpqPath_MemoHash (state, vertex) & (work->memo_capacity - 1) ;
+    while (work->memo[slot] != NULL)
+    {
+        if (work->memo[slot]->state == state && work->memo[slot]->vertex == vertex)
+        {
+            *cell = work->memo[slot] ;
+            return (GrB_SUCCESS) ;
+        }
+        slot = (slot + 1) & (work->memo_capacity - 1) ;
+    }
+    int info = LAGraph_Calloc ((void **) cell, 1, sizeof (**cell), msg) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    (*cell)->state = state ;
+    (*cell)->vertex = vertex ;
+    work->memo[slot] = *cell ;
+    work->memo_count++ ;
+    return (GrB_SUCCESS) ;
+}
+
+// Store a recovered prefix in its memo cell.  Repeated NFA derivations of the
+// same path in this cell reuse its entry; equal nodes in other cells are not
+// canonicalized.  Prefix nodes remain immutable and can outlive the memo table.
+static int LG_RpqPath_MemoExtend
+(
+    LG_RpqPath_Reconstruction *work,
+    LG_RpqPath_MemoCell *cell,
+    const LG_RpqPath_Node *prefix,
+    size_t label,
+    const LG_RpqPath_Node **path,
+    char *msg
+)
+{
+    for (size_t k = 0 ; k < cell->count ; k++)
+    {
+        const LG_RpqPath_Node *saved = cell->paths[k] ;
+        if ((prefix == NULL || saved->label == label) &&
+            LG_RpqPath_EqualNodes (saved->prefix, prefix))
+        {
+            *path = saved ;
+            return (GrB_SUCCESS) ;
+        }
+    }
+    if (cell->count == cell->capacity)
+    {
+        if (cell->capacity > SIZE_MAX / 2 / sizeof (*cell->paths))
+            return (GrB_OUT_OF_MEMORY) ;
+        size_t capacity = cell->capacity == 0 ? 4 : 2 * cell->capacity ;
+        int info = LAGraph_Realloc ((void **) &cell->paths, capacity,
+            cell->capacity, sizeof (*cell->paths), msg) ;
+        if (info != GrB_SUCCESS) return (info) ;
+        cell->capacity = capacity ;
+    }
+    int info = LG_RpqPath_ReserveResults (work, work->count + 1, msg) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    LG_RpqPath_PathBlock *block = work->result->blocks ;
+    if (block == NULL || block->count == 64)
+    {
+        LG_RpqPath_PathBlock *next = NULL ;
+        info = LAGraph_Malloc ((void **) &next, 1, sizeof (*next), msg) ;
+        if (info != GrB_SUCCESS) return (info) ;
+        next->next = block ;
+        next->count = 0 ;
+        work->result->blocks = block = next ;
+    }
+    LG_RpqPath_Node *node = &block->nodes[block->count++] ;
+    *node = (LG_RpqPath_Node) { .prefix = prefix, .vertex = cell->vertex,
+        .label = prefix == NULL ? 0 : label,
+        .length = prefix == NULL ? 0 : prefix->length + 1 } ;
+    cell->paths[cell->count++] = node ;
+    *path = node ;
+    return (GrB_SUCCESS) ;
+}
+
+// Publish one prefix upward through the active frames, extending it by one
+// shared node per frame.  The endpoint emits a descriptor, not a path copy.
+static int LG_RpqPath_Publish
+(
+    LG_RpqPath_Reconstruction *work,
+    LG_RpqPath_Frame *frame,
+    const LG_RpqPath_Node *path,
+    char *msg
+)
+{
+    if (work->count >= LG_RPQ_PATH_MAX_COUNT) return (GrB_SUCCESS) ;
+    if (frame->parent != NULL)
+    {
+        const LG_RpqPath_Node *extended = NULL ;
+        int info = LG_RpqPath_MemoExtend (work, frame->parent->cell, path,
+            frame->label, &extended, msg) ;
+        if (info != GrB_SUCCESS) return (info) ;
+        return (LG_RpqPath_Publish (work, frame->parent, extended, msg)) ;
+    }
+    if (frame->best != NULL && path->length < *frame->best)
+        *frame->best = path->length ;
+    for (size_t k = 0 ; k < work->count ; k++)
+        if (LG_RpqPath_EqualNodes (work->paths[k].tail, path)) return (GrB_SUCCESS) ;
+    int info = LG_RpqPath_ReserveResults (work, work->count + 1, msg) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    work->paths[work->count++] = (LG_RpqPath_Path)
+        { .length = path->length, .tail = path } ;
+    return (GrB_SUCCESS) ;
+}
 
 /**
  * @brief Reserve the working backward prefix for length edges.
@@ -1566,64 +1801,6 @@ static int LG_RpqPath_ReservePath
         capacity, reconstruction->capacity, sizeof (uint64_t), msg) ;
     if (info == GrB_SUCCESS) reconstruction->capacity = capacity ;
     return (info) ;
-}
-
-/**
- * @brief Save a distinct forward copy of the current backward prefix.
- * @param[in,out] reconstruction Owns a valid reverse_path of 2*length+1 slots
- *     and all saved paths, including after allocation failure.
- * @param[in] length Edge count in the prefix; may be zero.
- * @param[out] msg Optional LAGRAPH_MSG_LEN error buffer.
- * @return GrB_SUCCESS or allocation error.
- * A linear scan compares full vertex/label sequences, deduplicating NFA runs.
- * The working prefix stays unchanged; the saved path owns a separate buffer.
- */
-static int LG_RpqPath_SavePath
-(
-    LG_RpqPath_Reconstruction *reconstruction,
-    size_t length,
-    char *msg
-)
-{
-    if (reconstruction->count >= LG_RPQ_PATH_MAX_COUNT) return (GrB_SUCCESS) ;
-    size_t slots = 2 * length + 1 ;
-    for (size_t k = 0 ; k < reconstruction->count ; k++)
-    {
-        const LG_RpqPath_Path *path = &reconstruction->paths[k] ;
-        if (path->length != length) continue ;
-        size_t i = 0 ;
-        while (i < slots && path->elements[i] ==
-            reconstruction->reverse_path[slots - 1 - i])
-        {
-            i++ ;
-        }
-        if (i == slots) return (GrB_SUCCESS) ;
-    }
-
-    if (reconstruction->count == SIZE_MAX)
-    {
-        LG_ERROR_MSG ("reconstructed path count exceeds addressable memory") ;
-        return (GrB_OUT_OF_MEMORY) ;
-    }
-    uint64_t *elements = NULL ;
-    int info = LAGraph_Malloc ((void **) &elements, slots,
-        sizeof (uint64_t), msg) ;
-    if (info != GrB_SUCCESS) return (info) ;
-    for (size_t i = 0 ; i < slots ; i++)
-    {
-        elements[i] = reconstruction->reverse_path[slots - 1 - i] ;
-    }
-    info = LAGraph_Realloc ((void **) &reconstruction->paths,
-        reconstruction->count + 1, reconstruction->count,
-        sizeof (LG_RpqPath_Path), msg) ;
-    if (info != GrB_SUCCESS)
-    {
-        LAGraph_Free ((void **) &elements, NULL) ;
-        return (info) ;
-    }
-    reconstruction->paths[reconstruction->count++] =
-        (LG_RpqPath_Path) { .length = length, .elements = elements } ;
-    return (GrB_SUCCESS) ;
 }
 
 // Path-local membership table, shared by simple vertices and trail edges.
@@ -1749,9 +1926,48 @@ typedef int (*LG_RpqPath_ReconstructCellFn)
     LG_RpqPath_Reconstruction *, GrB_Index, GrB_Index, size_t, void *, char *
 ) ;
 
-/** Save a root and traverse its predecessors using the selected visitor.
- * best is used only by shortest: update it on a root and prune longer prefixes.
- * Returned paths, traversal order and both build-time caps retain their meaning.
+// Cached simple/trail prefixes must fit the live branch.  Exclude the join
+// vertex for simple; trails compare directed labeled edges in backward order.
+static bool LG_RpqPath_MemoCompatible
+(
+    const LG_RpqPath_Node *path,
+    const LG_RpqPath_Visited *visited,
+    bool edges
+)
+{
+    if (visited == NULL || visited->count == 0) return (true) ;
+    for (const LG_RpqPath_Node *node = edges ? path : path->prefix ;
+         node != NULL && (!edges || node->prefix != NULL) ; node = node->prefix)
+    {
+        uint64_t key [3] = { node->vertex, 0, 0 } ;
+        if (edges)
+        {
+            key[1] = node->label ;
+            key[2] = node->prefix->vertex ;
+        }
+        if (visited->entries[LG_RpqPath_VisitSlot (visited, key)].used)
+            return (false) ;
+    }
+    return (true) ;
+}
+
+static int LG_RpqPath_LoadCell
+(
+    LG_RpqPath_Reconstruction *work,
+    GrB_Index state, GrB_Index vertex,
+    bool *root, LG_RpqPath_StoredSet *predecessors
+)
+{
+    int info = GrB_Matrix_extractElement_BOOL (root, work->roots, state, vertex) ;
+    if (info != GrB_SUCCESS && info != GrB_NO_VALUE) return (info) ;
+    info = GrB_Matrix_extractElement_UDT (predecessors, work->P, state, vertex) ;
+    return (info == GrB_NO_VALUE ? GrB_SUCCESS : info) ;
+}
+
+/** Restore root-to-cell prefixes, caching immutable chains on the way back.
+ * All/shortest caches carry a covered length budget.  Simple/trails caches
+ * become complete only at a top-level call: a nested DFS can omit prefixes
+ * forbidden by its external branch.  Partial cells never suppress traversal.
  */
 static int LG_RpqPath_ExpandCell
 (
@@ -1762,29 +1978,72 @@ static int LG_RpqPath_ExpandCell
     LG_RpqPath_ReconstructCellFn visit,
     void *context,
     size_t *best,
+    LG_RpqPath_Visited *visited,
+    bool edges,
     char *msg
 )
 {
     if (reconstruction->count >= LG_RPQ_PATH_MAX_COUNT) return (GrB_SUCCESS) ;
-    bool root = false ;
-    int info = GrB_Matrix_extractElement_BOOL (&root, reconstruction->roots,
-        state, vertex) ;
-    if (info != GrB_SUCCESS && info != GrB_NO_VALUE) return (info) ;
-    if (info == GrB_SUCCESS && root)
+    LG_RpqPath_MemoCell *cell = LG_RpqPath_MemoFind (reconstruction, state, vertex) ;
+    bool root = false, loaded = false ;
+    LG_RpqPath_StoredSet predecessors = { 0 } ;
+    int info = GrB_SUCCESS ;
+    if (cell == NULL)
     {
-        info = LG_RpqPath_SavePath (reconstruction, length, msg) ;
+        info = LG_RpqPath_LoadCell (reconstruction, state, vertex,
+            &root, &predecessors) ;
         if (info != GrB_SUCCESS) return (info) ;
-        if (best != NULL && length < *best) *best = length ;
+        // The endpoint loop can span a huge sparse graph: do not allocate
+        // a memo entry for every absent configuration.
+        if (!root && predecessors.count == 0) return (GrB_SUCCESS) ;
+        loaded = true ;
+        info = LG_RpqPath_MemoGet (reconstruction, state, vertex, &cell, msg) ;
+        if (info != GrB_SUCCESS) return (info) ;
     }
+    LG_RpqPath_Frame frame = { .parent = reconstruction->frame, .cell = cell,
+        .label = length == 0 ? 0 : reconstruction->reverse_path[2 * length - 1],
+        .best = best } ;
+    reconstruction->frame = &frame ;
+    size_t budget = LG_RPQ_PATH_MAX_LENGTH - length ;
+    if (best != NULL && *best - length < budget) budget = *best - length ;
+
+    if (cell->complete && cell->budget >= budget)
+    {
+        // Publishing can append to this cell through an ancestor on a cycle.
+        // Freeze the count, not the vector address, which may be reallocated.
+        size_t count = cell->count ;
+        for (size_t k = 0 ; k < count &&
+             reconstruction->count < LG_RPQ_PATH_MAX_COUNT ; k++)
+        {
+            const LG_RpqPath_Node *path = cell->paths[k] ;
+            if (path->length > budget || (best != NULL &&
+                (length > *best || path->length > *best - length)) ||
+                !LG_RpqPath_MemoCompatible (path, visited, edges)) continue ;
+            info = LG_RpqPath_Publish (reconstruction, &frame, path, msg) ;
+            if (info != GrB_SUCCESS) goto cell_cleanup ;
+        }
+        goto cell_cleanup ;
+    }
+
+    if (!loaded)
+    {
+        info = LG_RpqPath_LoadCell (reconstruction, state, vertex,
+            &root, &predecessors) ;
+        if (info != GrB_SUCCESS) goto cell_cleanup ;
+    }
+    if (root)
+    {
+        const LG_RpqPath_Node *path = NULL ;
+        info = LG_RpqPath_MemoExtend (reconstruction, cell, NULL, 0, &path, msg) ;
+        if (info != GrB_SUCCESS) goto cell_cleanup ;
+        info = LG_RpqPath_Publish (reconstruction, &frame, path, msg) ;
+        if (info != GrB_SUCCESS) goto cell_cleanup ;
+    }
+    info = GrB_SUCCESS ;
     if (length >= LG_RPQ_PATH_MAX_LENGTH ||
         reconstruction->count >= LG_RPQ_PATH_MAX_COUNT ||
-        (best != NULL && length >= *best)) return (GrB_SUCCESS) ;
+        (best != NULL && length >= *best)) goto cell_complete ;
 
-    LG_RpqPath_StoredSet predecessors = { 0 } ;
-    info = GrB_Matrix_extractElement_UDT (&predecessors, reconstruction->P,
-        state, vertex) ;
-    if (info == GrB_NO_VALUE) return (GrB_SUCCESS) ;
-    if (info != GrB_SUCCESS) return (info) ;
     for (const LG_RpqPath_StoredAllocation *block = predecessors.allocation ;
          block != NULL && reconstruction->count < LG_RPQ_PATH_MAX_COUNT ;
          block = block->previous)
@@ -1794,15 +2053,31 @@ static int LG_RpqPath_ExpandCell
         {
             const LG_RpqPath_Predecessor *predecessor = &block->records[k] ;
             info = LG_RpqPath_ReservePath (reconstruction, length + 1, msg) ;
-            if (info != GrB_SUCCESS) return (info) ;
+            if (info != GrB_SUCCESS) goto cell_cleanup ;
             reconstruction->reverse_path[2 * length + 1] = predecessor->label ;
             reconstruction->reverse_path[2 * length + 2] = predecessor->vertex ;
             info = visit (reconstruction, predecessor->state,
                 predecessor->vertex, length + 1, context, msg) ;
-            if (info != GrB_SUCCESS) return (info) ;
+            if (info != GrB_SUCCESS) goto cell_cleanup ;
         }
     }
-    return (GrB_SUCCESS) ;
+cell_complete:
+    if (reconstruction->count < LG_RPQ_PATH_MAX_COUNT &&
+        (visited == NULL || length == 0))
+    {
+        // Shortest's bound can decrease while descendants emit results.
+        size_t covered = LG_RPQ_PATH_MAX_LENGTH - length ;
+        if (best != NULL)
+        {
+            size_t remaining = *best > length ? *best - length : 0 ;
+            if (remaining < covered) covered = remaining ;
+        }
+        if (!cell->complete || covered > cell->budget) cell->budget = covered ;
+        cell->complete = true ;
+    }
+cell_cleanup:
+    reconstruction->frame = frame.parent ;
+    return (info) ;
 }
 
 static int LG_RpqPath_ReconstructAllCell
@@ -1812,7 +2087,7 @@ static int LG_RpqPath_ReconstructAllCell
 )
 {
     return (LG_RpqPath_ExpandCell (reconstruction, state, vertex, length,
-        LG_RpqPath_ReconstructAllCell, context, NULL, msg)) ;
+        LG_RpqPath_ReconstructAllCell, context, NULL, NULL, false, msg)) ;
 }
 
 static int LG_RpqPath_ReconstructSimpleCell
@@ -1827,7 +2102,7 @@ static int LG_RpqPath_ReconstructSimpleCell
     int info = LG_RpqPath_VisitInsert (&simple->vertices, key, &inserted, msg) ;
     if (info != GrB_SUCCESS || !inserted) return (info) ;
     info = LG_RpqPath_ExpandCell (reconstruction, state, vertex, length,
-        LG_RpqPath_ReconstructSimpleCell, context, NULL, msg) ;
+        LG_RpqPath_ReconstructSimpleCell, context, NULL, &simple->vertices, false, msg) ;
     LG_RpqPath_VisitErase (&simple->vertices, key) ;
     return (info) ;
 }
@@ -1852,7 +2127,7 @@ static int LG_RpqPath_ReconstructTrailsCell
         if (info != GrB_SUCCESS || !inserted) return (info) ;
     }
     info = LG_RpqPath_ExpandCell (reconstruction, state, vertex, length,
-        LG_RpqPath_ReconstructTrailsCell, context, NULL, msg) ;
+        LG_RpqPath_ReconstructTrailsCell, context, NULL, &trails->edges, true, msg) ;
     if (length != 0) LG_RpqPath_VisitErase (&trails->edges, key) ;
     return (info) ;
 }
@@ -1873,7 +2148,7 @@ static int LG_RpqPath_ReconstructShortestCell
     }
     if (length > shortest->best) return (GrB_SUCCESS) ;
     return (LG_RpqPath_ExpandCell (reconstruction, state, vertex, length,
-        LG_RpqPath_ReconstructShortestCell, context, &shortest->best, msg)) ;
+        LG_RpqPath_ReconstructShortestCell, context, &shortest->best, NULL, false, msg)) ;
 }
 
 // Enumerate endpoints in the existing order.  Each visitor unwinds its context
@@ -1964,12 +2239,12 @@ static int LG_RpqPath_ReconstructShortest
     for (size_t begin = 0 ; begin < reconstruction->count ; )
     {
         const LG_RpqPath_Path *first = &reconstruction->paths[begin] ;
-        GrB_Index destination = first->elements[2 * first->length] ;
+        GrB_Index destination = first->tail->vertex ;
         size_t end = begin, best = SIZE_MAX ;
         while (end < reconstruction->count)
         {
             const LG_RpqPath_Path *path = &reconstruction->paths[end] ;
-            if (path->elements[2 * path->length] != destination) break ;
+            if (path->tail->vertex != destination) break ;
             if (path->length < best) best = path->length ;
             end++ ;
         }
@@ -1977,7 +2252,6 @@ static int LG_RpqPath_ReconstructShortest
         {
             LG_RpqPath_Path path = reconstruction->paths[k] ;
             if (path.length == best) reconstruction->paths[kept++] = path ;
-            else LAGraph_Free ((void **) &path.elements, NULL) ;
         }
         begin = end ;
     }
@@ -1986,8 +2260,8 @@ static int LG_RpqPath_ReconstructShortest
 }
 
 /** Own common reconstruction buffers; semantics drivers own their contexts.
- * All accepted results are independent forward-order copies.  No continuation
- * predicate, cell cache or memoized path is retained by this layer.
+ * Memo vectors are temporary; shared nodes belong to the returned array.
+ * No result node refers to P, roots or the reconstruction stack.
  */
 static int LG_RpqPath_Process
 (
@@ -2012,6 +2286,21 @@ static int LG_RpqPath_Process
         *path_count = reconstruction.count ;
         reconstruction.paths = NULL ;
     }
+    for (size_t k = 0 ; k < reconstruction.memo_capacity ; k++)
+    {
+        LG_RpqPath_MemoCell *cell = reconstruction.memo[k] ;
+        if (cell == NULL) continue ;
+        LAGraph_Free ((void **) &cell->paths, NULL) ;
+        LAGraph_Free ((void **) &cell, NULL) ;
+    }
+    LAGraph_Free ((void **) &reconstruction.memo, NULL) ;
+    if (info == GrB_SUCCESS && reconstruction.count == 0)
+    {
+        // An empty result owns no public array, even if an intermediate
+        // memo entry caused allocation of node storage.
+        reconstruction.paths = *paths ;
+        *paths = NULL ;
+    }
     LG_RpqPath_FreePaths (&reconstruction.paths, reconstruction.count) ;
     LAGraph_Free ((void **) &reconstruction.reverse_path, NULL) ;
     return (info) ;
@@ -2023,7 +2312,7 @@ static int LG_RpqPath_Process
 
 /**
  * @brief Own initialization, traversal and cleanup for any public query mode.
- * @param[out] paths Non-NULL address receiving independently owned paths, or
+ * @param[out] paths Non-NULL address receiving an array owning shared nodes, or
  *     NULL on error/empty result.  Must not hold an unreleased array on entry.
  * @param[out] path_count Non-NULL address receiving the result count, or zero.
  * @param[in] R Borrowed NFA decomposition of nl possibly NULL label slots.

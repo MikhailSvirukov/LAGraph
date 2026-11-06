@@ -862,13 +862,27 @@ int LAGraph_2RegularPathQuery   // nodes reachable from the starting by the
 // Inputs must satisfy the documented preconditions; these functions perform
 // no input verification. The standalone benchmark supports Python --verify.
 
-/** One owned graph path: length edges and 2*length+1 integers in elements,
- *  ordered vertex, label, vertex, ..., label, vertex.  A zero-edge path stores
- *  one vertex.  All vertices and label indices are zero-based. */
+/** Immutable path node.  prefix points to the preceding graph path; label
+ * identifies its edge to vertex.  A root has prefix=NULL and length=0; its
+ * label is unused.  Nodes may be shared by paths in the same result array.
+ * All vertices and labels are zero-based. */
+typedef struct LAGraph_RpqPathNode
+{
+    const struct LAGraph_RpqPathNode *prefix ;
+    GrB_Index vertex ;
+    size_t label ;
+    size_t length ;
+}
+LAGraph_RpqPathNode ;
+
+/** One result path, read from tail back through prefix links.  All nodes are
+ * owned collectively by the returned array and remain valid until that whole
+ * array is released with LAGraph_2RpqPath_FreePaths.  Do not free nodes or
+ * individual descriptors separately, or pass an interior array pointer. */
 typedef struct
 {
     size_t length ;
-    uint64_t *elements ;
+    const LAGraph_RpqPathNode *tail ;
 }
 LAGraph_RpqPath ;
 
@@ -1101,11 +1115,11 @@ int LAGraph_2RpqPath_AllShortestPaths
 
 /**
  * @brief Release an array returned by any LAGraph_2RpqPath query function.
- * @param[in,out] paths Address of the owned array.  All element buffers and
+ * @param[in,out] paths Address of the owned array.  All shared node blocks and
  *     the array are freed, and *paths becomes NULL.  A NULL address or an
  *     already NULL array is accepted.
- * @param[in] path_count Number of initialized paths; ignored if the array is
- *     NULL.  The caller's count variable is not modified.
+ * @param[in] path_count Returned path count, retained for API compatibility.
+ *     The whole allocation is released; the count variable is not modified.
  * @param[out] msg Optional buffer of at least LAGRAPH_MSG_LEN bytes, cleared
  *     on entry; may be NULL.
  * @return GrB_SUCCESS.
