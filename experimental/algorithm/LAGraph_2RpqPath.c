@@ -1250,7 +1250,7 @@ int LG_RpqPath_Traverse
     // caller; frontier remains local and roots is borrowed throughout.
     GrB_Matrix P = NULL ;
     GrB_Matrix frontier = NULL ;
-    GrB_Index frontier_nvals = 0 ;
+    bool frontier_active = false ;
     LG_RpqPath_StoredOwner stored_owner =
     {
         .allocations = ATOMIC_VAR_INIT (NULL),
@@ -1304,10 +1304,11 @@ int LG_RpqPath_Traverse
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
     info = GrB_Matrix_dup (&frontier, roots) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    info = GrB_Matrix_nvals (&frontier_nvals, frontier) ;
+    info = GrB_Matrix_reduce_BOOL (&frontier_active, NULL,
+        GrB_LOR_MONOID_BOOL, frontier, NULL) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
 
-    while (frontier_nvals != 0)
+    while (frontier_active)
     {
         // 1. Create the matrices owned by this iteration.
         GrB_Matrix H = NULL ;
@@ -1352,16 +1353,13 @@ int LG_RpqPath_Traverse
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
         }
 
-        // 3. Compute the new frontier against OLD P.  eWiseUnion evaluates the
-        // predicate at C-only/P-only cells too, substituting empty sets.
-        info = GxB_Matrix_eWiseUnion (next_frontier, NULL, NULL,
+        //  TODO: do we need wait after each operation?
+        // 3. Compute the new frontier against OLD P, restricting the output
+        // to C's structure.  Keep explicit false flags; termination uses OR
+        // of the values rather than the number of stored entries.
+        info = GxB_Matrix_eWiseUnion (next_frontier, C, NULL,
             ops.has_new_predecessors, C, ops.empty_temporary, P, ops.empty_stored,
-            GrB_DESC_R) ;
-        if (info != GrB_SUCCESS) goto iteration_cleanup ;
-        // nvals counts explicit false entries too.  Retain only true flags
-        // before using this matrix as the next Boolean frontier.
-        info = GrB_Matrix_select_BOOL (next_frontier, NULL, NULL,
-            GrB_VALUEEQ_BOOL, next_frontier, true, GrB_DESC_R) ;
+            GrB_DESC_RS) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
         info = GrB_Matrix_wait (next_frontier, GrB_MATERIALIZE) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
@@ -1382,7 +1380,8 @@ int LG_RpqPath_Traverse
         atomic_store (&stored_owner.allocations,
             atomic_exchange (&next_stored_owner.allocations, NULL)) ;
         updating_P = false ;
-        info = GrB_Matrix_nvals (&frontier_nvals, next_frontier) ;
+        info = GrB_Matrix_reduce_BOOL (&frontier_active, NULL,
+            GrB_LOR_MONOID_BOOL, next_frontier, NULL) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
 
         // Transfer the frontier; cleanup must not free the next input.
