@@ -1969,6 +1969,51 @@ static void test_many_predecessors (void)
     test_check_query (&query) ;
 }
 
+/*
+ * 512 two-edge a branches converge at join; a direct edge reaches join
+ * earlier and a three-edge branch later.  join also has an a self-loop and
+ * a b edge to the sole accepting destination.  Thus the same P cell grows
+ * across iterations, then sees duplicates.  The large first batch stresses
+ * Bloom positives while the late branch must still be retained exactly.
+ */
+static void test_incremental_predecessor_blocks (void)
+{
+    enum { branches = 512, join = branches + 1,
+        late1 = join + 1, late2 = join + 2, target = join + 3 } ;
+    TestEdge graph [2 * branches + 6] ;
+    ExpectedPath expected [branches + 2] = { 0 } ;
+    size_t edges = 0 ;
+    graph[edges++] = (TestEdge) { 0, 0, join } ;
+    expected[0] = (ExpectedPath) { 2, { 0, 0, join, 1, target } } ;
+    for (size_t k = 1 ; k <= branches ; k++)
+    {
+        graph[edges++] = (TestEdge) { 0, 0, k } ;
+        graph[edges++] = (TestEdge) { k, 0, join } ;
+        expected[k] = (ExpectedPath) { 3,
+            { 0, 0, k, 0, join, 1, target } } ;
+    }
+    graph[edges++] = (TestEdge) { 0, 0, late1 } ;
+    graph[edges++] = (TestEdge) { late1, 0, late2 } ;
+    graph[edges++] = (TestEdge) { late2, 0, join } ;
+    graph[edges++] = (TestEdge) { join, 0, join } ;
+    graph[edges++] = (TestEdge) { join, 1, target } ;
+    expected[branches + 1] = (ExpectedPath) { 4,
+        { 0, 0, late1, 0, late2, 0, join, 1, target } } ;
+    const TestEdge automaton [] = { { 0, 0, 0 }, { 0, 1, 1 } } ;
+    const TestQuery query =
+    {
+        .graph_vertices = target + 1, .automaton_states = 2,
+        .graph_edges = graph, .graph_edge_count = edges,
+        .automaton_edges = automaton,
+        .automaton_edge_count = ARRAY_COUNT (automaton),
+        .QS = { 0 }, .nqs = 1, .QF = { 1 }, .nqf = 1,
+        .S = { 0 }, .ns = 1,
+        .expected = expected, .expected_count = ARRAY_COUNT (expected),
+        .run = LAGraph_2RpqPath_AllSimple
+    } ;
+    test_check_query (&query) ;
+}
+
 TEST_LIST =
 {
     { "RpqPath_chain", test_chain },
@@ -1991,6 +2036,7 @@ TEST_LIST =
     { "RpqPath_nonaccepting_cycle", test_nonaccepting_cycle },
     { "RpqPath_wide_graph", test_wide_graph },
     { "RpqPath_many_predecessors", test_many_predecessors },
+    { "RpqPath_incremental_predecessor_blocks", test_incremental_predecessor_blocks },
     { "RpqPath_simple_repeated_vertex", test_simple_repeated_vertex },
     { "RpqPath_simple_self_loop", test_simple_self_loop },
     { "RpqPath_simple_closed_path", test_simple_closed_path },

@@ -267,7 +267,7 @@ static LG_RpqPath_PredecessorBlock *LG_RpqPath_PoolAcquire
  * @brief Free all temporary blocks and clear the pool error flag.
  * @param[in,out] pool Initialized pool; may be empty.  No blocks are retained.
  * @pre All readers have finished and temporary handles have been discarded.
- *     On success, P already owns deep copies.  Read pool->error before reset.
+ *     On success, P has copied new triples into persistent blocks.  Read pool->error before reset.
  */
 static void LG_RpqPath_PoolReset (LG_RpqPath_BlockPool *pool)
 {
@@ -513,22 +513,27 @@ static void LG_RpqPath_CollectPredecessors
 // Stored predecessor sets (P): ownership and operations
 //------------------------------------------------------------------------------
 
-// Each P buffer is one allocation containing its ownership link and records.
-// Old and new P buffers are tracked separately during an in-place eWiseUnion.
-// GraphBLAS only copies their handles and does not manage the pointed-to memory.
+// Each cell is an immutable chain of iteration deltas.  A new block contains
+// only newly discovered triples and points to the previous head.  The separate
+// allocation list owns all blocks until reconstruction finishes; GraphBLAS
+// copies handles without managing the pointed-to memory.
 typedef struct LG_RpqPath_StoredAllocation
 {
-    struct LG_RpqPath_StoredAllocation *next ;
+    size_t count ;
+    const struct LG_RpqPath_StoredAllocation *previous ;
+    struct LG_RpqPath_StoredAllocation *allocation_next ;
     LG_RpqPath_Predecessor records [] ;
 }
 LG_RpqPath_StoredAllocation ;
 
 // P values refer to ordinary heap allocations, never to the temporary arena.
-// count records are valid and sorted by (state, vertex, label).
+// count is the total across the chain.  Each block is sorted, not the chain.
+// The 128-bit Bloom filter covers the whole set; positives need exact lookup.
 typedef struct
 {
     size_t count ;
     LG_RpqPath_StoredAllocation *allocation ; // NULL denotes the empty set
+    uint64_t bloom [2] ;
 }
 LG_RpqPath_StoredSet ;
 
@@ -550,13 +555,12 @@ typedef struct
 LG_RpqPath_StoredContext ;
 
 /**
- * @brief Allocate an independent P record buffer and register its owner.
+ * @brief Allocate one immutable delta block and register its query owner.
  *
  * @param[in,out] owner Non-NULL owner of the new P buffers.  Concurrent
  *     registrations are allowed; removal is deferred until callbacks finish.
- * @param[in] capacity Number of record slots to allocate in the new buffer.
- * @param[out] result Non-NULL output initialized to an empty StoredSet.  On
- *     success it references the registered allocation, with count still zero.
+ * @param[in] capacity Number of new triples to store in the block.
+ * @param[out] result Receives the registered block, or NULL on failure.
  * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes.
  * @return GrB_SUCCESS or an allocation error.  Registration happens before
  *     the handle can be given to GraphBLAS, so error cleanup never needs to
@@ -566,12 +570,11 @@ static int LG_RpqPath_StoredAllocate
 (
     LG_RpqPath_StoredOwner *owner,
     size_t capacity,
-    LG_RpqPath_StoredSet *result,
+    LG_RpqPath_StoredAllocation **result,
     char *msg
 )
 {
-    result->count = 0 ;
-    result->allocation = NULL ;
+    *result = NULL ;
     if (capacity > (SIZE_MAX - sizeof (LG_RpqPath_StoredAllocation)) /
         sizeof (LG_RpqPath_Predecessor))
     {
@@ -583,16 +586,18 @@ static int LG_RpqPath_StoredAllocate
     LG_RpqPath_StoredAllocation *allocation = NULL ;
     int info = LAGraph_Malloc ((void **) &allocation, 1, bytes, msg) ;
     if (info != GrB_SUCCESS) return (info) ;
+    allocation->count = capacity ;
+    allocation->previous = NULL ;
     // Only the new private node's link changes on a retry.  Existing nodes
     // remain immutable, and none can be freed while registration is active.
     LG_RpqPath_StoredAllocation *head = atomic_load (&owner->allocations) ;
     do
     {
-        allocation->next = head ;
+        allocation->allocation_next = head ;
     }
     while (!atomic_compare_exchange_weak (&owner->allocations, &head,
         allocation)) ;
-    result->allocation = allocation ;
+    *result = allocation ;
     return (GrB_SUCCESS) ;
 }
 
@@ -601,8 +606,8 @@ static int LG_RpqPath_StoredAllocate
  *
  * @param[in,out] owner Non-NULL initialized owner.  Its list is cleared and
  *     error flag reset; calling again on an empty owner is safe.
- * @pre No callback is registering buffers, and no surviving matrix value or
- *     pending operation uses them.  Wait for P before releasing its old owner.
+ * @pre No callback, surviving matrix value or reconstruction uses the blocks.
+ *     This owner is released only on query completion or traversal failure.
  */
 static void LG_RpqPath_StoredRelease (LG_RpqPath_StoredOwner *owner)
 {
@@ -610,66 +615,105 @@ static void LG_RpqPath_StoredRelease (LG_RpqPath_StoredOwner *owner)
         atomic_exchange (&owner->allocations, NULL) ;
     while (allocation != NULL)
     {
-        LG_RpqPath_StoredAllocation *next = allocation->next ;
+        LG_RpqPath_StoredAllocation *next = allocation->allocation_next ;
         LAGraph_Free ((void **) &allocation, NULL) ;
         allocation = next ;
     }
     atomic_store (&owner->error, GrB_SUCCESS) ;
 }
 
+// SplitMix64 finalizer: unsigned arithmetic is intentional.  The filter is
+// only a negative test; hash collisions never replace exact triple comparison.
+static uint64_t LG_RpqPath_Hash (uint64_t x)
+{
+    x = (x ^ (x >> 30)) * UINT64_C (0xbf58476d1ce4e5b9) ;
+    x = (x ^ (x >> 27)) * UINT64_C (0x94d049bb133111eb) ;
+    return (x ^ (x >> 31)) ;
+}
+
+static void LG_RpqPath_BloomBits
+(
+    const LG_RpqPath_Predecessor *record,
+    uint64_t bits [2]
+)
+{
+    uint64_t h = LG_RpqPath_Hash (record->state +
+        UINT64_C (0x9e3779b97f4a7c15)) ;
+    h = LG_RpqPath_Hash (h ^ record->vertex) ;
+    h = LG_RpqPath_Hash (h ^ (uint64_t) record->label) ;
+    bits[0] = (UINT64_C (1) << (h & 63)) |
+              (UINT64_C (1) << ((h >> 6) & 63)) ;
+    bits[1] = (UINT64_C (1) << ((h >> 12) & 63)) |
+              (UINT64_C (1) << ((h >> 18) & 63)) ;
+}
+
 /**
- * @brief Determine whether a C value contains a record absent from the old P.
- *
- * @param[out] z Output bool for GxB_eWiseUnion; true iff x adds a predecessor.
- * @param[in] x Sorted TemporarySet from C, or its empty substitute scalar.
- * @param[in] y Sorted StoredSet from P, or its empty substitute scalar.
- *
- * Both operands are read-only.  Missing and explicitly empty cells have the
- * same set semantics.  C-only positions compare against empty P and P-only
- * positions compare against empty C.  No allocation or mutation is performed.
+ * @brief Test membership using Bloom rejection, then binary search per block.
+ * @param[in] stored Immutable P snapshot, including its cumulative filter.
+ * @param[in] record Triple to find, compared in full on every Bloom positive.
+ * @return True exactly when the triple occurs in one of the sorted blocks.
+ */
+static bool LG_RpqPath_StoredContains
+(
+    const LG_RpqPath_StoredSet *stored,
+    const LG_RpqPath_Predecessor *record
+)
+{
+    uint64_t bits [2] ;
+    LG_RpqPath_BloomBits (record, bits) ;
+    if ((stored->bloom[0] & bits[0]) != bits[0] ||
+        (stored->bloom[1] & bits[1]) != bits[1]) return (false) ;
+
+    for (const LG_RpqPath_StoredAllocation *block = stored->allocation ;
+         block != NULL ; block = block->previous)
+    {
+        size_t low = 0, high = block->count ;
+        while (low < high)
+        {
+            size_t mid = low + (high - low) / 2 ;
+            int order = LG_RpqPath_ComparePredecessors (
+                record, &block->records[mid]) ;
+            if (order == 0) return (true) ;
+            if (order < 0) high = mid ;
+            else low = mid + 1 ;
+        }
+    }
+    return (false) ;
+}
+
+/**
+ * @brief Return one Boolean per cell, stopping at the first new C triple.
+ * @param[out] z Boolean GraphBLAS result.
+ * @param[in] x Sorted temporary C set, or the empty substitute scalar.
+ * @param[in] y Immutable P snapshot, or the empty substitute scalar.
  */
 static void LG_RpqPath_HasNewPredecessors (void *z, const void *x, const void *y)
 {
     const LG_RpqPath_TemporarySet *temporary = x ;
     const LG_RpqPath_StoredSet *stored = y ;
-    const LG_RpqPath_PredecessorBlock *block = temporary->head ;
-    size_t temporary_index = 0, stored_index = 0 ;
-
-    while (block != NULL)
+    for (const LG_RpqPath_PredecessorBlock *block = temporary->head ;
+         block != NULL ; block = block->next)
     {
-        if (stored_index == stored->count)
+        for (size_t k = 0 ; k < block->count ; k++)
         {
-            *(bool *) z = true ;
-            return ;
+            if (!LG_RpqPath_StoredContains (stored, &block->records[k]))
+            {
+                *(bool *) z = true ;
+                return ;
+            }
         }
-        int order = LG_RpqPath_ComparePredecessors (
-            &block->records[temporary_index],
-            &stored->allocation->records[stored_index]) ;
-        if (order < 0)
-        {
-            *(bool *) z = true ;
-            return ;
-        }
-        if (order == 0)
-        {
-            LG_RpqPath_TemporaryAdvance (&block, &temporary_index) ;
-        }
-        stored_index++ ;
     }
     *(bool *) z = false ;
 }
 
 /**
- * @brief Deep-copy a stored set and a temporary set into their sorted union.
- *
- * @param[in] stored Immutable old P value; an empty value has count=0.
- * @param[in] temporary Immutable C value, with sorted distinct records.
- * @param[in,out] owner Non-NULL owner registering all new P buffers.
- * @param[out] result Receives a newly allocated union with no arena references
- *     and no shared record storage with stored.  All equal records occur once.
- * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes.
- * @return GrB_SUCCESS or GrB_OUT_OF_MEMORY.  Inputs remain unchanged on failure.
- *     The result allocation, once created, belongs to owner until freed.
+ * @brief Prepend one block containing C minus old P, sharing the old chain.
+ * @param[in] stored Immutable P snapshot; globally sorted order is unnecessary.
+ * @param[in] temporary Sorted distinct C records; owns no persistent memory.
+ * @param[in,out] owner Query owner of all persistent delta blocks.
+ * @param[out] result Updated handle, or the unchanged handle for an empty delta.
+ * @param[out] msg Optional allocation error message.
+ * @return GrB_SUCCESS or an allocation/size error; old blocks never change.
  */
 static int LG_RpqPath_MergeStoredSet
 (
@@ -680,70 +724,64 @@ static int LG_RpqPath_MergeStoredSet
     char *msg
 )
 {
-    // Determine the allocation bound without relying on a fixed set capacity.
-    // Duplicate removal during merging may leave unused slots in this buffer.
-    size_t capacity = stored->count ;
+    *result = *stored ;
+    size_t added = 0 ;
+    // Count first so duplicate-heavy updates do not reserve space for old
+    // triples.  Recheck against the same immutable snapshot when filling.
     for (const LG_RpqPath_PredecessorBlock *block = temporary->head ;
          block != NULL ; block = block->next)
     {
-        if (block->count > SIZE_MAX - capacity)
+        for (size_t k = 0 ; k < block->count ; k++)
         {
-            LG_ERROR_MSG ("stored predecessor count exceeds addressable memory") ;
-            return (GrB_OUT_OF_MEMORY) ;
-        }
-        capacity += block->count ;
-    }
-    int info = LG_RpqPath_StoredAllocate (owner, capacity, result, msg) ;
-    if (info != GrB_SUCCESS) return (info) ;
-
-    const LG_RpqPath_PredecessorBlock *block = temporary->head ;
-    size_t temporary_index = 0, stored_index = 0 ;
-    while (block != NULL || stored_index < stored->count)
-    {
-        const LG_RpqPath_Predecessor *record ;
-        if (block == NULL)
-        {
-            record = &stored->allocation->records[stored_index++] ;
-        }
-        else if (stored_index == stored->count)
-        {
-            record = &block->records[temporary_index] ;
-            LG_RpqPath_TemporaryAdvance (&block, &temporary_index) ;
-        }
-        else
-        {
-            const LG_RpqPath_Predecessor *temporary_record =
-                &block->records[temporary_index] ;
-            const LG_RpqPath_Predecessor *stored_record =
-                &stored->allocation->records[stored_index] ;
-            int order = LG_RpqPath_ComparePredecessors (
-                temporary_record, stored_record) ;
-            record = (order <= 0) ? temporary_record : stored_record ;
-            if (order <= 0)
+            if (LG_RpqPath_StoredContains (stored, &block->records[k])) continue ;
+            if (added == SIZE_MAX - stored->count)
             {
-                LG_RpqPath_TemporaryAdvance (&block, &temporary_index) ;
+                LG_ERROR_MSG ("stored predecessor count exceeds addressable memory") ;
+                return (GrB_OUT_OF_MEMORY) ;
             }
-            if (order >= 0) stored_index++ ;
+            added++ ;
         }
-        result->allocation->records[result->count++] = *record ;
     }
+    if (added == 0) return (GrB_SUCCESS) ;
+
+    LG_RpqPath_StoredAllocation *delta = NULL ;
+    int info = LG_RpqPath_StoredAllocate (owner, added, &delta, msg) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    delta->previous = stored->allocation ;
+    size_t used = 0 ;
+    for (const LG_RpqPath_PredecessorBlock *block = temporary->head ;
+         block != NULL ; block = block->next)
+    {
+        for (size_t k = 0 ; k < block->count ; k++)
+        {
+            const LG_RpqPath_Predecessor *record = &block->records[k] ;
+            if (LG_RpqPath_StoredContains (stored, record)) continue ;
+            delta->records[used++] = *record ;
+            uint64_t bits [2] ;
+            LG_RpqPath_BloomBits (record, bits) ;
+            result->bloom[0] |= bits[0] ;
+            result->bloom[1] |= bits[1] ;
+        }
+    }
+    result->count += added ;
+    result->allocation = delta ;
     return (GrB_SUCCESS) ;
 }
 
 /**
- * @brief Produce a deep-copied P value from a C value and the old P value.
+ * @brief Extend an immutable P chain with one block of new C triples.
  *
- * @param[out] z StoredSet result, with an independent sorted record buffer.
+ * @param[out] z StoredSet handle sharing old blocks and owning its new delta.
  * @param[in] x TemporarySet from C, or the empty substitute scalar.
  * @param[in] ix Row of x; unused because records contain all required fields.
  * @param[in] jx Column of x; unused.
  * @param[in] y StoredSet from the old P, or the empty substitute scalar.
  * @param[in] iy Row of y; unused.
  * @param[in] jy Column of y; unused.
- * @param[in] theta Non-NULL bound StoredContext with the new buffers' owner.
+ * @param[in] theta Non-NULL bound StoredContext with the query block owner.
  *
  * Used by eWiseUnion at every position of C union P, including P-only cells.
- * All records are copied by value; neither input buffer is modified or freed.
+ * Only new records are copied; old blocks are shared, never modified or freed.
  * Input handles are captured before writing z, which may alias an input.
  * On failure the result is empty and the owner's error flag is set.  After
  * waiting for P, the caller checks that flag before accepting the new P.
@@ -805,7 +843,7 @@ typedef struct
 
     GrB_Type state_set_type ;        // H value: header and room for nr states
     GrB_Type temporary_set_type ;    // C value: handle to temporary blocks
-    GrB_Type stored_set_type ;       // P value: owned array of predecessors
+    GrB_Type stored_set_type ;       // P value: immutable chain and Bloom filter
 
     // Traversal matrices are local to Traverse, never stored in this context.
 }
@@ -1120,7 +1158,7 @@ static int LG_RpqPath_CreatePredecessorOperators
  * @param[in] work Borrowed temporary/stored predecessor value types from Init.
  * @param[in] pool Non-NULL arena borrowed by the empty temporary-set scalar.
  * @return GrB_SUCCESS or a GraphBLAS error.  The stored-set merger is bound to
- *     a reusable new-buffer owner separately, before traversal starts.
+ *     the persistent block owner separately, before traversal starts.
  */
 static int LG_RpqPath_CreateAccumulationOperators
 (
@@ -1192,12 +1230,12 @@ static int LG_RpqPath_CreatePredecessorSemiring
 }
 
 /**
- * @brief Bind the P-merging operator to a reusable new-buffer owner.
+ * @brief Bind the P-merging operator to its persistent query block owner.
  * @param[out] merge Non-NULL address of a NULL handle receiving the operator.
  * @param[out] scalar Non-NULL address of a NULL handle receiving its bound scalar.
  * @param[in] ops Borrowed initialized accumulation operators and context type.
- * @param[in] owner Non-NULL initialized new-buffer owner, alive throughout
- *     traversal.  Transfer its allocations and reset it only after wait(P).
+ * @param[in] owner Non-NULL initialized owner, alive throughout traversal.
+ *     Its blocks survive all iterations and are transferred for reconstruction.
  * @return GrB_SUCCESS or a GraphBLAS error.  Created handles, including partial
  *     setup on failure, belong to the caller and are freed in traversal cleanup.
  */
@@ -1258,13 +1296,6 @@ int LG_RpqPath_Traverse
         .error = ATOMIC_VAR_INIT (GrB_SUCCESS)
     } ;
 
-    // The bound merger keeps this address for the entire traversal.  Each
-    // completed iteration transfers its allocations to stored_owner.
-    LG_RpqPath_StoredOwner next_stored_owner =
-    {
-        .allocations = ATOMIC_VAR_INIT (NULL),
-        .error = ATOMIC_VAR_INIT (GrB_SUCCESS)
-    } ;
     GrB_Scalar stored_context = NULL ;
     GrB_BinaryOp stored_merge = NULL ;
     LG_RpqPath_LabelOperators *label_ops = NULL ;
@@ -1298,7 +1329,7 @@ int LG_RpqPath_Traverse
         if (info != GrB_SUCCESS) goto traversal_cleanup ;
     }
     info = LG_RpqPath_CreateStoredMerge (&stored_merge, &stored_context,
-        &ops, &next_stored_owner) ;
+        &ops, &stored_owner) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
 
     info = GrB_Matrix_new (&P, work->stored_set_type, work->nr, work->ng) ;
@@ -1363,21 +1394,19 @@ int LG_RpqPath_Traverse
             GrB_LOR_MONOID_BOOL, next_frontier, NULL) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
 
-        // 4. Update P in place with independent deep copies, including P-only
-        // cells.  eWiseAdd would bypass the merger at one-sided positions.
+        // 4. Extend P with one delta block per changed cell.  P-only cells
+        // reuse their old handles; eWiseUnion also converts C-only values.
         updating_P = true ;
         info = GxB_Matrix_eWiseUnion (P, NULL, NULL, stored_merge,
             C, ops.empty_temporary, P, ops.empty_stored, NULL) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
         info = GrB_Matrix_wait (P, GrB_MATERIALIZE) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
-        info = atomic_load (&next_stored_owner.error) ;
+        info = atomic_load (&stored_owner.error) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
 
-        // 5. After wait(P), release old buffers and transfer the new ownership.
-        LG_RpqPath_StoredRelease (&stored_owner) ;
-        atomic_store (&stored_owner.allocations,
-            atomic_exchange (&next_stored_owner.allocations, NULL)) ;
+        // 5. All persistent blocks stay query-owned for shared old chains.
+        // The P wait allows this iteration's temporary C pool to be reset.
         updating_P = false ;
 
         // Transfer the frontier; cleanup must not free the next input.
@@ -1401,9 +1430,8 @@ iteration_cleanup:
         }
         if (updating_P)
         {
-            // A failed in-place merge may leave handles from either owner in
-            // P.  Finish pending callbacks and discard P before freeing either
-            // owner's buffers or resetting C's arena.
+            // A failed merge may leave partial handles in P.  Finish its
+            // callbacks before resetting C's arena or releasing query blocks.
             int cleanup_info = GrB_Matrix_wait (P, GrB_MATERIALIZE) ;
             if (info == GrB_SUCCESS) info = cleanup_info ;
             GrB_free (&P) ;
@@ -1415,12 +1443,11 @@ iteration_cleanup:
         GrB_free (&H) ;
         GrB_free (&C) ;
         GrB_free (&next_frontier) ;
-        LG_RpqPath_StoredRelease (&next_stored_owner) ;
         LG_RpqPath_PoolReset (&pool) ;
         if (info != GrB_SUCCESS) goto traversal_cleanup ;
     }
 
-    // Return P and its independent buffers for reconstruction.
+    // Return P and all persistent delta blocks for reconstruction.
     *P_handle = P ;
     P = NULL ;
     atomic_store (&P_owner->allocations,
@@ -1431,7 +1458,6 @@ traversal_cleanup:
     // The owner list also tracks buffers whose handles GraphBLAS discarded.
     GrB_free (&P) ;
     LG_RpqPath_StoredRelease (&stored_owner) ;
-    LG_RpqPath_StoredRelease (&next_stored_owner) ;
     GrB_free (&stored_merge) ;
     GrB_free (&stored_context) ;
     if (label_ops != NULL)
@@ -1738,19 +1764,23 @@ static int LG_RpqPath_ReconstructCell
     info = GrB_Matrix_extractElement_UDT (&predecessors, P, state, vertex) ;
     if (info == GrB_NO_VALUE) return (GrB_SUCCESS) ;
     if (info != GrB_SUCCESS) return (info) ;
-    for (size_t k = 0 ; k < predecessors.count ; k++)
+    for (const LG_RpqPath_StoredAllocation *block = predecessors.allocation ;
+         block != NULL ; block = block->previous)
     {
-        if (reconstruction->count >= LG_RPQ_PATH_MAX_COUNT) break ;
-        const LG_RpqPath_Predecessor *predecessor =
-            &predecessors.allocation->records[k] ;
-        info = LG_RpqPath_ReservePath (reconstruction, length + 1, msg) ;
-        if (info != GrB_SUCCESS) return (info) ;
-        reconstruction->reverse_path[2 * length + 1] = predecessor->label ;
-        reconstruction->reverse_path[2 * length + 2] = predecessor->vertex ;
-        info = LG_RpqPath_ReconstructCell (P, roots,
-            predecessor->state, predecessor->vertex, length + 1,
-            reconstruction, should_continue, msg) ;
-        if (info != GrB_SUCCESS) return (info) ;
+        for (size_t k = 0 ; k < block->count ; k++)
+        {
+            if (reconstruction->count >= LG_RPQ_PATH_MAX_COUNT) break ;
+            const LG_RpqPath_Predecessor *predecessor =
+                &block->records[k] ;
+            info = LG_RpqPath_ReservePath (reconstruction, length + 1, msg) ;
+            if (info != GrB_SUCCESS) return (info) ;
+            reconstruction->reverse_path[2 * length + 1] = predecessor->label ;
+            reconstruction->reverse_path[2 * length + 2] = predecessor->vertex ;
+            info = LG_RpqPath_ReconstructCell (P, roots,
+                predecessor->state, predecessor->vertex, length + 1,
+                reconstruction, should_continue, msg) ;
+            if (info != GrB_SUCCESS) return (info) ;
+        }
     }
     return (GrB_SUCCESS) ;
 }
