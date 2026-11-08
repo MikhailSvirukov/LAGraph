@@ -1121,12 +1121,12 @@ static int LG_RpqPath_CreatePredecessorOperators
         "LG_RpqPath_CollectPredecessors", NULL) ;
     if (info != GrB_SUCCESS) return (info) ;
 
-    // Expand the active frontier with SAXPY.  This requires the GraphBLAS fix
-    // for workspace sizes and casts of generic flipped indexed operators.
+    // Let GraphBLAS choose the product method.  Its SAXPY paths require the
+    // fix for workspace sizes and casts of generic flipped indexed operators.
     info = GrB_Descriptor_new (&ops->predecessor_product) ;
     if (info != GrB_SUCCESS) return (info) ;
     info = GrB_Descriptor_set (ops->predecessor_product,
-        GxB_AxB_METHOD, GxB_AxB_SAXPY) ;
+        GxB_AxB_METHOD, GrB_DEFAULT) ;
     if (info != GrB_SUCCESS) return (info) ;
 
     return (GrB_SUCCESS) ;
