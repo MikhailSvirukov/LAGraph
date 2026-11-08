@@ -156,9 +156,45 @@ static void test_shortest_early_stop(void)
     release(G,R);
 }
 
+/* A self-loop feeds both itself and an accepting edge.  Recursive propagation
+ * must consume entries appended while the loop is active, pass each to the
+ * accepting branch, and stop immediately at the distinct-result count cap.
+ */
+static void test_recursive_cycle_count_cap(void)
+{
+    const Edge graph[] = {{0,0,0},{0,1,1}};
+    const Edge nfa[] = {{0,0,0},{0,1,1}};
+    LAGraph_Graph G[3], R[3];
+    TEST_ASSERT(LAGraph_Init(msg) == GrB_SUCCESS);
+    build(G,2,graph,COUNT(graph)); build(R,2,nfa,COUNT(nfa));
+    const GrB_Index QS[] = {0}, QF[] = {1}, S[] = {0};
+    const bool inverse[] = {false,false,false};
+    LAGraph_RpqPath *paths = NULL; size_t count = 0;
+    TEST_ASSERT(LAGraph_2RpqPath_AllPaths(&paths,&count,R,inverse,3,
+        QS,1,QF,1,G,S,1,false,msg) == GrB_SUCCESS);
+    TEST_ASSERT(count == 4);
+    bool seen[4] = {false,false,false,false};
+    for (size_t k = 0; k < count; k++)
+    {
+        size_t length = paths[k].length;
+        TEST_ASSERT(length >= 1 && length <= 4);
+        TEST_CHECK(!seen[length - 1]); seen[length - 1] = true;
+        for (size_t j = 0; j < length; j++)
+        {
+            TEST_CHECK(element(&paths[k],2*j) == 0);
+            TEST_CHECK(element(&paths[k],2*j+1) == (j+1 == length ? 1 : 0));
+        }
+        TEST_CHECK(paths[k].tail->vertex == 1);
+    }
+    TEST_CHECK(seen[0] && seen[1] && seen[2] && seen[3]);
+    TEST_CHECK(LAGraph_2RpqPath_FreePaths(&paths,count,msg) == GrB_SUCCESS);
+    release(G,R);
+}
+
 TEST_LIST = {
     {"RpqPath_length_bound",test_length_bound},
     {"RpqPath_count_bound",test_count_bound},
     {"RpqPath_shortest_early_stop",test_shortest_early_stop},
+    {"RpqPath_recursive_cycle_count_cap",test_recursive_cycle_count_cap},
     {NULL,NULL}
 };

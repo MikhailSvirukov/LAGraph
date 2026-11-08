@@ -1274,7 +1274,7 @@ int LG_RpqPath_Traverse
     // caller; frontier remains local and roots is borrowed throughout.
     GrB_Matrix P = NULL ;
     GrB_Matrix frontier = NULL ;
-    bool frontier_active = false ;
+    GrB_Index frontier_nvals = 0 ;
     LG_RpqPath_StoredOwner stored_owner =
     {
         .allocations = ATOMIC_VAR_INIT (NULL),
@@ -1321,11 +1321,10 @@ int LG_RpqPath_Traverse
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
     info = GrB_Matrix_dup (&frontier, roots) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    info = GrB_Matrix_reduce_BOOL (&frontier_active, NULL,
-        GrB_LOR_MONOID_BOOL, frontier, NULL) ;
+    info = GrB_Matrix_nvals (&frontier_nvals, frontier) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
 
-    while (frontier_active)
+    while (frontier_nvals != 0)
     {
         // 1. Create the matrices owned by this iteration.
         GrB_Matrix H = NULL ;
@@ -1366,17 +1365,19 @@ int LG_RpqPath_Traverse
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
         }
 
-        // 3. Compute the new frontier against OLD P, restricting the output
-        // to C's structure.  Keep explicit false flags; termination uses OR
-        // of the values rather than the number of stored entries.
-        info = GxB_Matrix_eWiseUnion (next_frontier, C, NULL,
+        // 3. Compute the new frontier against OLD P without a mask.  P-only
+        // cells and unchanged candidates produce false; remove those entries
+        // before this matrix is used by the next iteration's products.
+        info = GxB_Matrix_eWiseUnion (next_frontier, NULL, NULL,
             ops.has_new_predecessors, C, ops.empty_temporary, P, ops.empty_stored,
-            GrB_DESC_RS) ;
+            GrB_DESC_R) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
-        // Reduce to a C scalar before updating P.  In SuiteSparse:GraphBLAS
-        // this resolves pending frontier values without a separate wait.
-        info = GrB_Matrix_reduce_BOOL (&frontier_active, NULL,
-            GrB_LOR_MONOID_BOOL, next_frontier, NULL) ;
+        info = GrB_Matrix_select_BOOL (next_frontier, NULL, NULL,
+            GrB_VALUEEQ_BOOL, next_frontier, true, GrB_DESC_R) ;
+        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+        // Selection leaves only true entries, so nvals is the termination
+        // test.  It also resolves pending entries before P is updated.
+        info = GrB_Matrix_nvals (&frontier_nvals, next_frontier) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
 
         // 4. Extend P with one delta block per changed cell.  P-only cells
@@ -1400,7 +1401,7 @@ int LG_RpqPath_Traverse
         next_frontier = NULL ;
 
 iteration_cleanup:
-        // 6. On success, the frontier reduction and P wait have finished all
+        // 6. On success, the frontier nvals and P wait have finished all
         // readers of old P and C.  Only failures need extra cleanup waits.
         // Preserve the first error and check pool.error before resetting it.
         if (info != GrB_SUCCESS && next_frontier != NULL)
@@ -1509,8 +1510,9 @@ typedef struct LG_RpqPath_MemoEdge
 {
     LG_RpqPath_MemoCell *source, *destination ;
     size_t label, cursor ;
-    bool queued ;
-    struct LG_RpqPath_MemoEdge *dependent_next, *queue_next, *allocation_next ;
+    // Reentrant cycles leave new source entries for this invocation's loop.
+    bool active ;
+    struct LG_RpqPath_MemoEdge *dependent_next, *allocation_next ;
 }
 LG_RpqPath_MemoEdge ;
 
@@ -1534,7 +1536,8 @@ typedef struct
     LG_RpqPath_MemoCell **memo ;
     size_t memo_count, memo_capacity ;
     LG_RpqPath_MemoCell *load_head, *distance_head, *distance_tail ;
-    LG_RpqPath_MemoEdge *edges, *queue_head, *queue_tail ;
+    LG_RpqPath_MemoEdge *edges ;
+    LG_RpqPath_MemoCell *target ;    // accepting cell currently emitting results
     LG_RpqPath_CachedNode **output_index ;
     size_t output_capacity ;
     bool shortest ;
@@ -1682,22 +1685,6 @@ static int LG_RpqPath_MemoGet
     return (GrB_SUCCESS) ;
 }
 
-// Each dependency consumes each source-prefix index exactly once, including
-// on cycles.  Registering a new dependency replays the existing cache from 0.
-static void LG_RpqPath_QueueEdge
-(
-    LG_RpqPath_Reconstruction *work,
-    LG_RpqPath_MemoEdge *edge
-)
-{
-    if (edge->queued || edge->cursor == edge->source->count) return ;
-    edge->queued = true ;
-    edge->queue_next = NULL ;
-    if (work->queue_tail != NULL) work->queue_tail->queue_next = edge ;
-    else work->queue_head = edge ;
-    work->queue_tail = edge ;
-}
-
 static int LG_RpqPath_MemoExtend
 (
     LG_RpqPath_Reconstruction *work,
@@ -1762,8 +1749,6 @@ static int LG_RpqPath_MemoExtend
         .hash = hash, .hash_next = cell->index[slot] } ;
     cell->index[slot] = stored ;
     cell->paths[cell->count++] = &stored->node ;
-    for (LG_RpqPath_MemoEdge *edge = cell->dependents ; edge != NULL ;
-         edge = edge->dependent_next) LG_RpqPath_QueueEdge (work, edge) ;
     return (GrB_SUCCESS) ;
 }
 
@@ -2065,7 +2050,6 @@ static int LG_RpqPath_PrepareCell
                     .label = record->label, .dependent_next = source->dependents,
                     .allocation_next = work->edges } ;
                 work->edges = source->dependents = edge ;
-                LG_RpqPath_QueueEdge (work, edge) ;
                 if (source->distance != SIZE_MAX)
                     LG_RpqPath_RelaxDistance (work, cell, source->distance + 1) ;
                 if (!source->loaded && !source->scheduled)
@@ -2098,30 +2082,48 @@ static int LG_RpqPath_PrepareCell
     return (GrB_SUCCESS) ;
 }
 
-static int LG_RpqPath_PropagateOne
+// Recursively consume each (dependency, source-prefix) pair exactly once.
+// A new destination prefix is passed to its dependents immediately.  An edge
+// already active on this call stack is not entered again: its outer loop will
+// consume any source entries appended by the cycle before it returns.
+static int LG_RpqPath_Propagate
 (
-    LG_RpqPath_Reconstruction *work, LG_RpqPath_JoinFn join, void *context, char *msg
+    LG_RpqPath_Reconstruction *work, LG_RpqPath_MemoEdge *edge,
+    LG_RpqPath_JoinFn join, void *context, char *msg
 )
 {
-    LG_RpqPath_MemoEdge *edge = work->queue_head ;
-    work->queue_head = edge->queue_next ;
-    if (work->queue_head == NULL) work->queue_tail = NULL ;
-    edge->queued = false ;
-    const LG_RpqPath_Node *prefix = edge->source->paths[edge->cursor++] ;
-    if (prefix->length < LG_RPQ_PATH_MAX_LENGTH && (!work->shortest ||
-        prefix->length + 1 == edge->destination->distance))
+    if (edge->active) return (GrB_SUCCESS) ;
+    edge->active = true ;
+    int info = GrB_SUCCESS ;
+    while (edge->cursor < edge->source->count && work->count < LG_RPQ_PATH_MAX_COUNT)
     {
+        // Cache vectors may move during recursion; immutable prefix nodes do not.
+        const LG_RpqPath_Node *prefix = edge->source->paths[edge->cursor++] ;
+        if (prefix->length >= LG_RPQ_PATH_MAX_LENGTH || (work->shortest &&
+            prefix->length + 1 != edge->destination->distance)) continue ;
         bool accept = false ;
-        int info = join (prefix, edge, context, &accept, msg) ;
-        if (info != GrB_SUCCESS) return (info) ;
-        if (accept)
+        info = join (prefix, edge, context, &accept, msg) ;
+        if (info != GrB_SUCCESS) break ;
+        if (!accept) continue ;
+        size_t count = edge->destination->count ;
+        info = LG_RpqPath_MemoExtend (work, edge->destination, prefix, edge->label, msg) ;
+        if (info != GrB_SUCCESS) break ;
+        if (count == edge->destination->count) continue ;
+        if (edge->destination == work->target)
         {
-            info = LG_RpqPath_MemoExtend (work, edge->destination, prefix, edge->label, msg) ;
-            if (info != GrB_SUCCESS) return (info) ;
+            info = LG_RpqPath_Publish (work, edge->destination->paths[count], msg) ;
+            if (info != GrB_SUCCESS) break ;
         }
+        for (LG_RpqPath_MemoEdge *next = edge->destination->dependents ; next != NULL &&
+             work->count < LG_RPQ_PATH_MAX_COUNT ; next = next->dependent_next)
+        {
+            info = LG_RpqPath_Propagate (work, next, join, context, msg) ;
+            if (info != GrB_SUCCESS) break ;
+        }
+        if (info != GrB_SUCCESS) break ;
     }
-    LG_RpqPath_QueueEdge (work, edge) ;
-    return (GrB_SUCCESS) ;
+    edge->active = false ;
+    return (info) ;
 }
 
 // Collect only columns present in accepting rows, including zero-edge roots.
@@ -2192,16 +2194,19 @@ static int LG_RpqPath_GenerateTargets
             if (info != GrB_SUCCESS) goto generate_cleanup ;
             info = LG_RpqPath_PrepareCell (work, target, msg) ;
             if (info != GrB_SUCCESS) goto generate_cleanup ;
-            size_t emitted = 0 ;
-            for (;;)
+            work->target = target ;
+            for (size_t emitted = 0 ; emitted < target->count &&
+                 work->count < LG_RPQ_PATH_MAX_COUNT ; emitted++)
             {
-                while (emitted < target->count && work->count < LG_RPQ_PATH_MAX_COUNT)
-                {
-                    info = LG_RpqPath_Publish (work, target->paths[emitted++], msg) ;
-                    if (info != GrB_SUCCESS) goto generate_cleanup ;
-                }
-                if (work->count >= LG_RPQ_PATH_MAX_COUNT || work->queue_head == NULL) break ;
-                info = LG_RpqPath_PropagateOne (work, join, context, msg) ;
+                info = LG_RpqPath_Publish (work, target->paths[emitted], msg) ;
+                if (info != GrB_SUCCESS) goto generate_cleanup ;
+            }
+            // Newly registered dependencies replay existing source prefixes;
+            // old dependencies retain their cursors across accepting targets.
+            for (LG_RpqPath_MemoEdge *edge = work->edges ; edge != NULL &&
+                 work->count < LG_RPQ_PATH_MAX_COUNT ; edge = edge->allocation_next)
+            {
+                info = LG_RpqPath_Propagate (work, edge, join, context, msg) ;
                 if (info != GrB_SUCCESS) goto generate_cleanup ;
             }
         }
