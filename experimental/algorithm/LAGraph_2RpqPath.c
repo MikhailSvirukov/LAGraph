@@ -1354,7 +1354,12 @@ int LG_RpqPath_Traverse
             info = GrB_mxm (H, NULL, NULL, ops.state_semiring,
                 work->N[a], frontier, nfa_direction) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
-            // GraphBLAS resolves H's dependency without an intermediate wait.
+            // An inactive label contributes nothing.  Skip its product before
+            // the backend can transpose the entire graph operand for DOT.
+            GrB_Index h_nvals = 0 ;
+            info = GrB_Matrix_nvals (&h_nvals, H) ;
+            if (info != GrB_SUCCESS) goto iteration_cleanup ;
+            if (h_nvals == 0) continue ;
             // Accumulate into C; H's column j identifies the predecessor vertex
             // even when the graph operand is transposed.
             info = GrB_Descriptor_set (ops.predecessor_product, GrB_INP1,
