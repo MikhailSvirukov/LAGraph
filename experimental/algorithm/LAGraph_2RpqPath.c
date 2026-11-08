@@ -1121,16 +1121,12 @@ static int LG_RpqPath_CreatePredecessorOperators
         "LG_RpqPath_CollectPredecessors", NULL) ;
     if (info != GrB_SUCCESS) return (info) ;
 
-    // Correctness workaround for SuiteSparse's generic flipped indexed SAXPY
-    // kernel: it sizes operand buffers using GB_GENERIC_FLIPXY, overlooking
-    // GB_GENERIC_IDX_FLIPXY.  StateSet x bool can therefore copy a full StateSet
-    // into a bool-sized buffer when the backend swaps operands for CSR/CSC.
-    // The generic dot kernel handles mixed operand sizes correctly.  This is
-    // an explicit backend restriction, not a performance tuning decision.
+    // Expand the active frontier with SAXPY.  This requires the GraphBLAS fix
+    // for workspace sizes and casts of generic flipped indexed operators.
     info = GrB_Descriptor_new (&ops->predecessor_product) ;
     if (info != GrB_SUCCESS) return (info) ;
     info = GrB_Descriptor_set (ops->predecessor_product,
-        GxB_AxB_METHOD, GxB_AxB_DOT) ;
+        GxB_AxB_METHOD, GxB_AxB_SAXPY) ;
     if (info != GrB_SUCCESS) return (info) ;
 
     return (GrB_SUCCESS) ;
@@ -1355,7 +1351,7 @@ int LG_RpqPath_Traverse
                 work->N[a], frontier, nfa_direction) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
             // An inactive label contributes nothing.  Skip its product before
-            // the backend can transpose the entire graph operand for DOT.
+            // the backend prepares the graph operand for multiplication.
             GrB_Index h_nvals = 0 ;
             info = GrB_Matrix_nvals (&h_nvals, H) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
