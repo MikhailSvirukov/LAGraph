@@ -2197,6 +2197,7 @@ static int LG_RpqPath_GenerateTargets
             LG_RpqPath_MemoCell *target = NULL ;
             info = LG_RpqPath_MemoGet (work, QF[k], vertices[i], &target, msg) ;
             if (info != GrB_SUCCESS) goto generate_cleanup ;
+            LG_RpqPath_MemoEdge *previous_edges = work->edges ;
             info = LG_RpqPath_PrepareCell (work, target, msg) ;
             if (info != GrB_SUCCESS) goto generate_cleanup ;
             work->target = target ;
@@ -2207,8 +2208,9 @@ static int LG_RpqPath_GenerateTargets
                 if (info != GrB_SUCCESS) goto generate_cleanup ;
             }
             // Newly registered dependencies replay existing source prefixes;
-            // old dependencies retain their cursors across accepting targets.
-            for (LG_RpqPath_MemoEdge *edge = work->edges ; edge != NULL &&
+            // old dependencies were drained by the previous target.  Further
+            // source additions reach them recursively, without a global scan.
+            for (LG_RpqPath_MemoEdge *edge = work->edges ; edge != previous_edges &&
                  work->count < LG_RPQ_PATH_MAX_COUNT ; edge = edge->allocation_next)
             {
                 info = LG_RpqPath_Propagate (work, edge, join, context, msg) ;
