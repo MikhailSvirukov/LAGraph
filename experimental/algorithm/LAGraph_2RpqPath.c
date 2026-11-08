@@ -962,11 +962,13 @@ typedef struct
     GxB_IndexBinaryOp collect_state ;
     GrB_BinaryOp state_multiply ;
     GrB_Semiring state_semiring ;
+    GrB_Descriptor state_product ;
     GrB_Scalar state_capacity ;
     GrB_BinaryOp predecessor_union ;
     GrB_Monoid predecessor_union_monoid ;
     GxB_IndexBinaryOp collect_predecessors ;
     GrB_Type predecessor_context_type ;
+    GrB_Descriptor predecessor_product ;
     GrB_BinaryOp has_new_predecessors ;
     GrB_Scalar empty_temporary ;
     GrB_Scalar empty_stored ;
@@ -999,11 +1001,13 @@ static void LG_RpqPath_FreeOperators (LG_RpqPath_Operators *ops)
     GrB_free (&ops->stored_context_type) ;
     GrB_free (&ops->empty_temporary) ;
     GrB_free (&ops->empty_stored) ;
+    GrB_free (&ops->predecessor_product) ;
     GrB_free (&ops->collect_predecessors) ;
     GrB_free (&ops->predecessor_union_monoid) ;
     GrB_free (&ops->predecessor_union) ;
     GrB_free (&ops->predecessor_context_type) ;
     GrB_free (&ops->state_semiring) ;
+    GrB_free (&ops->state_product) ;
     GrB_free (&ops->state_multiply) ;
     GrB_free (&ops->collect_state) ;
     GrB_free (&ops->state_union_monoid) ;
@@ -1059,6 +1063,15 @@ static int LG_RpqPath_CreateStateOperators
     info = GrB_Semiring_new (&ops->state_semiring, ops->state_union_monoid,
         ops->state_multiply) ;
     if (info != GrB_SUCCESS) goto state_cleanup ;
+    info = GrB_Descriptor_new (&ops->state_product) ;
+    if (info != GrB_SUCCESS) goto state_cleanup ;
+    info = GrB_Descriptor_set (ops->state_product, GrB_OUTP, GrB_REPLACE) ;
+    if (info != GrB_SUCCESS) goto state_cleanup ;
+    info = GrB_Descriptor_set (ops->state_product, GrB_INP0, GrB_TRAN) ;
+    if (info != GrB_SUCCESS) goto state_cleanup ;
+    info = GrB_Descriptor_set (ops->state_product,
+        GxB_AxB_METHOD, GxB_AxB_SAXPY) ;
+    if (info != GrB_SUCCESS) goto state_cleanup ;
 
 state_cleanup:
     LAGraph_Free ((void **) &empty_state_set, NULL) ;
@@ -1073,7 +1086,7 @@ state_cleanup:
  * @param[in] pool Non-NULL initialized arena, borrowed through all uses of its
  *     empty-set identity and label-bound multipliers.
  * @return GrB_SUCCESS or a GraphBLAS error.  The multiplier is bound per label
- *     separately; this function creates its reusable indexed operator only.
+ *     separately; this function creates its indexed operator and SAXPY descriptor.
  */
 static int LG_RpqPath_CreatePredecessorOperators
 (
@@ -1099,6 +1112,11 @@ static int LG_RpqPath_CreatePredecessorOperators
         LG_RpqPath_CollectPredecessors, work->temporary_set_type,
         work->state_set_type, GrB_BOOL, ops->predecessor_context_type,
         "LG_RpqPath_CollectPredecessors", NULL) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    info = GrB_Descriptor_new (&ops->predecessor_product) ;
+    if (info != GrB_SUCCESS) return (info) ;
+    info = GrB_Descriptor_set (ops->predecessor_product,
+        GxB_AxB_METHOD, GxB_AxB_SAXPY) ;
     if (info != GrB_SUCCESS) return (info) ;
 
     return (GrB_SUCCESS) ;
@@ -1317,7 +1335,7 @@ int LG_RpqPath_Traverse
             // H[p,j] = {q | N_a[q,p] && frontier[q,j]}.  REPLACE discards
             // the previous label's H values; frontier is only read.
             info = GrB_mxm (H, NULL, NULL, ops.state_semiring,
-                work->N[a], frontier, GrB_DESC_RT0) ;
+                work->N[a], frontier, ops.state_product) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
             // An inactive label contributes nothing.  Skip its product before
             // the backend prepares the graph operand for multiplication.
@@ -1325,10 +1343,10 @@ int LG_RpqPath_Traverse
             info = GrB_Matrix_nvals (&h_nvals, H) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
             if (h_nvals == 0) continue ;
-            // The caller supplies graph directions.  Use AUTO multiplication;
+            // The caller supplies graph directions.  Use SAXPY multiplication;
             // H's column j identifies the predecessor vertex.
             info = GrB_mxm (C, NULL, ops.predecessor_union, label_ops[a].semiring,
-                H, work->A[a], NULL) ;
+                H, work->A[a], ops.predecessor_product) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
         }
 

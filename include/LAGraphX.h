@@ -919,7 +919,7 @@ LAGraph_RpqPath ;
  * label indices.  Equal graph paths from different NFA runs are emitted once.
  * The caller prepares matrix directions, state sets and sources before the
  * call, and adapts result order when needed.  Graph edges are read as G_a[u,v]
- * and NFA transitions as R_a[q,p].  Multiplication uses GraphBLAS AUTO.
+ * and NFA transitions as R_a[q,p].  Multiplication uses GraphBLAS SAXPY.
  * Input graphs are not modified and no query storage is retained on return.
  */
 LAGRAPHX_PUBLIC
