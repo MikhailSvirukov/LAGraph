@@ -897,8 +897,6 @@ LAGraph_RpqPath ;
  *     is returned on error.
  * @param[in] R NFA decomposition: nl borrowed graph handles indexed by label.
  *     Slots may be NULL; at least one adjacency matrix must exist.
- * @param[in] inverse_labels Non-NULL array of nl flags.  A true entry traverses
- *     that graph label backwards, before whole-query inversion is applied.
  * @param[in] nl Positive number of label slots shared by R and G.
  * @param[in] QS Array of nqs initial NFA states; NULL allowed when nqs=0.
  * @param[in] nqs Number of initial-state entries; duplicates are allowed.
@@ -908,8 +906,6 @@ LAGraph_RpqPath ;
  *     Slots may be NULL; at least one adjacency matrix must exist.
  * @param[in] S Array of ns source vertices; NULL allowed when ns=0.
  * @param[in] ns Number of source entries; duplicates are allowed.
- * @param[in] inverse Reverse the NFA and flip every graph label's direction.
- *     QS, QF and S are used as supplied; the state sets are not swapped.
  * @param[out] msg Optional error buffer of at least LAGRAPH_MSG_LEN bytes;
  *     may be NULL and is cleared on entry.
  * @return GrB_SUCCESS, or an input, allocation or GraphBLAS error code.
@@ -921,6 +917,9 @@ LAGraph_RpqPath ;
  * Zero-edge paths are included when a source has an initial accepting state.
  * Result sequences follow the query's traversal direction and retain original
  * label indices.  Equal graph paths from different NFA runs are emitted once.
+ * The caller prepares matrix directions, state sets and sources before the
+ * call, and adapts result order when needed.  Graph edges are read as G_a[u,v]
+ * and NFA transitions as R_a[q,p].  Multiplication uses GraphBLAS AUTO.
  * Input graphs are not modified and no query storage is retained on return.
  */
 LAGRAPHX_PUBLIC
@@ -929,7 +928,6 @@ int LAGraph_2RpqPath_AllPaths
     LAGraph_RpqPath **paths,
     size_t *path_count,
     LAGraph_Graph *R,
-    const bool *inverse_labels,
     size_t nl,
     const GrB_Index *QS,
     size_t nqs,
@@ -938,7 +936,6 @@ int LAGraph_2RpqPath_AllPaths
     LAGraph_Graph *G,
     const GrB_Index *S,
     size_t ns,
-    bool inverse,
     char *msg
 ) ;
 
@@ -955,8 +952,7 @@ int LAGraph_2RpqPath_AllPaths
  *     on error/empty result.  No partial result is returned on error.
  * @param[in] R Borrowed NFA decomposition with nl possibly NULL label slots.
  *     At least one adjacency matrix must exist.
- * @param[in] inverse_labels Non-NULL array of nl graph-direction flags.
- * @param[in] nl Positive shared label-slot count for G, R and inverse_labels.
+ * @param[in] nl Positive shared label-slot count for G and R.
  * @param[in] QS Array of nqs initial NFA states; NULL allowed when nqs=0.
  * @param[in] nqs Number of initial-state entries; duplicates are allowed.
  * @param[in] QF Array of nqf accepting NFA states; NULL allowed when nqf=0.
@@ -965,8 +961,6 @@ int LAGraph_2RpqPath_AllPaths
  *     At least one adjacency matrix must exist.
  * @param[in] S Array of ns source vertices; NULL allowed when ns=0.
  * @param[in] ns Number of source entries; duplicates are allowed.
- * @param[in] inverse Reverse the NFA and toggle every label's graph direction.
- *     QS, QF and S are used as supplied; state sets are not swapped.
  * @param[out] msg Optional buffer of at least LAGRAPH_MSG_LEN bytes, cleared on
  *     entry; may be NULL.
  * @return GrB_SUCCESS, or an input, allocation or GraphBLAS error code.
@@ -983,7 +977,6 @@ int LAGraph_2RpqPath_AllSimple
     LAGraph_RpqPath **paths,
     size_t *path_count,
     LAGraph_Graph *R,
-    const bool *inverse_labels,
     size_t nl,
     const GrB_Index *QS,
     size_t nqs,
@@ -992,7 +985,6 @@ int LAGraph_2RpqPath_AllSimple
     LAGraph_Graph *G,
     const GrB_Index *S,
     size_t ns,
-    bool inverse,
     char *msg
 ) ;
 
@@ -1010,8 +1002,7 @@ int LAGraph_2RpqPath_AllSimple
  *     on error/empty result.  No partial result is returned on error.
  * @param[in] R Borrowed NFA decomposition with nl possibly NULL label slots.
  *     At least one adjacency matrix must exist.
- * @param[in] inverse_labels Non-NULL array of nl graph-direction flags.
- * @param[in] nl Positive shared label-slot count for G, R and inverse_labels.
+ * @param[in] nl Positive shared label-slot count for G and R.
  * @param[in] QS Array of nqs initial NFA states; NULL allowed when nqs=0.
  * @param[in] nqs Number of initial-state entries; duplicates are allowed.
  * @param[in] QF Array of nqf accepting NFA states; NULL allowed when nqf=0.
@@ -1020,8 +1011,6 @@ int LAGraph_2RpqPath_AllSimple
  *     At least one adjacency matrix must exist.
  * @param[in] S Array of ns source vertices; NULL allowed when ns=0.
  * @param[in] ns Number of source entries; duplicates are allowed.
- * @param[in] inverse Reverse the NFA and toggle every label's graph direction.
- *     QS, QF and S are used as supplied; state sets are not swapped.
  * @param[out] msg Optional buffer of at least LAGRAPH_MSG_LEN bytes, cleared on
  *     entry; may be NULL.
  * @return GrB_SUCCESS, or an input, allocation or GraphBLAS error code.
@@ -1038,7 +1027,6 @@ int LAGraph_2RpqPath_AllTrails
     LAGraph_RpqPath **paths,
     size_t *path_count,
     LAGraph_Graph *R,
-    const bool *inverse_labels,
     size_t nl,
     const GrB_Index *QS,
     size_t nqs,
@@ -1047,7 +1035,6 @@ int LAGraph_2RpqPath_AllTrails
     LAGraph_Graph *G,
     const GrB_Index *S,
     size_t ns,
-    bool inverse,
     char *msg
 ) ;
 
@@ -1068,8 +1055,7 @@ int LAGraph_2RpqPath_AllTrails
  *     on error/empty result.  No partial result is returned on error.
  * @param[in] R Borrowed NFA decomposition with nl possibly NULL label slots.
  *     At least one adjacency matrix must exist.
- * @param[in] inverse_labels Non-NULL array of nl graph-direction flags.
- * @param[in] nl Positive shared label-slot count for G, R and inverse_labels.
+ * @param[in] nl Positive shared label-slot count for G and R.
  * @param[in] QS Array of nqs initial NFA states; NULL allowed when nqs=0.
  * @param[in] nqs Number of initial-state entries; duplicates are allowed.
  * @param[in] QF Array of nqf accepting NFA states; NULL allowed when nqf=0.
@@ -1078,8 +1064,6 @@ int LAGraph_2RpqPath_AllTrails
  *     At least one adjacency matrix must exist.
  * @param[in] S Array of ns source vertices; NULL allowed when ns=0.
  * @param[in] ns Number of source entries; duplicates are allowed.
- * @param[in] inverse Reverse the NFA and toggle every label's graph direction.
- *     QS, QF and S are used as supplied; state sets are not swapped.
  * @param[out] msg Optional buffer of at least LAGRAPH_MSG_LEN bytes, cleared on
  *     entry; may be NULL.
  * @return GrB_SUCCESS, or an input, allocation or GraphBLAS error code.
@@ -1099,7 +1083,6 @@ int LAGraph_2RpqPath_AllShortestPaths
     LAGraph_RpqPath **paths,
     size_t *path_count,
     LAGraph_Graph *R,
-    const bool *inverse_labels,
     size_t nl,
     const GrB_Index *QS,
     size_t nqs,
@@ -1108,7 +1091,6 @@ int LAGraph_2RpqPath_AllShortestPaths
     LAGraph_Graph *G,
     const GrB_Index *S,
     size_t ns,
-    bool inverse,
     char *msg
 ) ;
 

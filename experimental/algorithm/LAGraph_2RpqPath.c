@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 //
 // Query lifecycle: initialize metadata, build P, reconstruct paths, clean up.
-// The matrix stage uses a Boolean frontier M.  For each label a (direct case):
+// The matrix stage uses a Boolean frontier M.  For each label a:
 //
 //   H[p,j] = { q : N_a[q,p] && M[q,j] },
 //   C[p,i] = { (q,j,a) : q belongs to H[p,j] && G_a[j,i] }.
@@ -817,14 +817,11 @@ typedef struct
     GrB_Index ng ;                   // number of graph vertices
     GrB_Index nr ;                   // number of automaton states
     size_t nl ;                      // number of label slots
-    bool inverse ;                   // reverse the whole query
 
     // Arrays are owned by this workspace; the matrices they reference belong
-    // to the caller.  Transposition is requested through GraphBLAS descriptors;
-    // no cached transposes are retained or used by the traversal.
-    GrB_Matrix *A ;                  // original graph decomposition
-    GrB_Matrix *N ;                  // original NFA decomposition
-    bool *reverse_graph ;           // inverse XOR inverse_labels[label]
+    // to the caller, who supplies the graph and NFA traversal directions.
+    GrB_Matrix *A ;                  // prepared graph decomposition
+    GrB_Matrix *N ;                  // prepared NFA decomposition
 
     GrB_Type state_set_type ;        // H value: header and room for nr states
     GrB_Type temporary_set_type ;    // C value: handle to temporary blocks
@@ -849,7 +846,6 @@ static void LG_RpqPath_Free (LG_RpqPath_Workspace **workspace)
     GrB_free (&work->stored_set_type) ;
     LAGraph_Free ((void **) &work->A, NULL) ;
     LAGraph_Free ((void **) &work->N, NULL) ;
-    LAGraph_Free ((void **) &work->reverse_graph, NULL) ;
     LAGraph_Free ((void **) workspace, NULL) ;
 }
 
@@ -898,24 +894,20 @@ static int LG_RpqPath_PrepareDecomposition
  * @param[out] workspace Receives owned workspace, or NULL on error; free with
  *     LG_RpqPath_Free.  Must not contain an unreleased workspace.
  * @param[in] R Borrowed NFA decomposition, nl slots; absent labels may be NULL.
- * @param[in] inverse_labels nl flags reversing individual graph labels.
- * @param[in] nl Positive number of slots in R, G and inverse_labels.
+ * @param[in] nl Positive number of slots in R and G.
  * @param[in] G Borrowed graph decomposition, nl slots; absent labels may be NULL.
- * @param[in] inverse Reverse the NFA and toggle each graph-label direction.
  * @param[out] msg Optional LAGRAPH_MSG_LEN buffer, cleared on entry.
  * @return GrB_SUCCESS or LAGraph/GraphBLAS error; partial setup is freed.
  * Each decomposition must contain a matrix.  Inputs remain alive for the query;
- * only handles and direction flags are copied.  Query owns roots; Traverse owns
+ * only handles are copied.  Query owns roots; Traverse owns
  * its working matrices.  Indices are zero-based.
  */
 int LG_RpqPath_Init
 (
     LG_RpqPath_Workspace **workspace,
     LAGraph_Graph *R,
-    const bool *inverse_labels,
     size_t nl,
     LAGraph_Graph *G,
-    bool inverse,
     char *msg
 )
 {
@@ -927,13 +919,10 @@ int LG_RpqPath_Init
     LG_TRY (LAGraph_Calloc ((void **) &work, 1,
         sizeof (LG_RpqPath_Workspace), msg)) ;
     work->nl = nl ;
-    work->inverse = inverse ;
     LG_TRY (LAGraph_Calloc ((void **) &work->A, nl,
         sizeof (GrB_Matrix), msg)) ;
     LG_TRY (LAGraph_Calloc ((void **) &work->N, nl,
         sizeof (GrB_Matrix), msg)) ;
-    LG_TRY (LAGraph_Calloc ((void **) &work->reverse_graph, nl,
-        sizeof (bool), msg)) ;
 
     // Prepare the graph decomposition and determine its vertex count.
     LG_TRY (LG_RpqPath_PrepareDecomposition (G, nl,
@@ -942,13 +931,6 @@ int LG_RpqPath_Init
     // Prepare the NFA decomposition and determine its state count separately.
     LG_TRY (LG_RpqPath_PrepareDecomposition (R, nl,
         work->N, &work->nr, msg)) ;
-
-    // Whole-query inversion reverses the NFA traversal and flips each graph
-    // label's direction.  Keep the original label index for predecessor records.
-    for (size_t a = 0 ; a < nl ; a++)
-    {
-        work->reverse_graph[a] = (inverse != inverse_labels[a]) ;
-    }
 
     // H has variable-size values across queries, but one fixed value size
     // within a query.  Reserve all nr state slots in every value.  Guard the
@@ -985,7 +967,6 @@ typedef struct
     GrB_Monoid predecessor_union_monoid ;
     GxB_IndexBinaryOp collect_predecessors ;
     GrB_Type predecessor_context_type ;
-    GrB_Descriptor predecessor_product ;
     GrB_BinaryOp has_new_predecessors ;
     GrB_Scalar empty_temporary ;
     GrB_Scalar empty_stored ;
@@ -1018,7 +999,6 @@ static void LG_RpqPath_FreeOperators (LG_RpqPath_Operators *ops)
     GrB_free (&ops->stored_context_type) ;
     GrB_free (&ops->empty_temporary) ;
     GrB_free (&ops->empty_stored) ;
-    GrB_free (&ops->predecessor_product) ;
     GrB_free (&ops->collect_predecessors) ;
     GrB_free (&ops->predecessor_union_monoid) ;
     GrB_free (&ops->predecessor_union) ;
@@ -1119,15 +1099,6 @@ static int LG_RpqPath_CreatePredecessorOperators
         LG_RpqPath_CollectPredecessors, work->temporary_set_type,
         work->state_set_type, GrB_BOOL, ops->predecessor_context_type,
         "LG_RpqPath_CollectPredecessors", NULL) ;
-    if (info != GrB_SUCCESS) return (info) ;
-
-    // The benchmark uses inverse queries for single-destination searches.
-    // Choose by query direction, including when individual labels are reversed.
-    // SAXPY requires the generic flipped indexed operator fix in GraphBLAS.
-    info = GrB_Descriptor_new (&ops->predecessor_product) ;
-    if (info != GrB_SUCCESS) return (info) ;
-    info = GrB_Descriptor_set (ops->predecessor_product,
-        GxB_AxB_METHOD, work->inverse ? GxB_AxB_DOT : GxB_AxB_SAXPY) ;
     if (info != GrB_SUCCESS) return (info) ;
 
     return (GrB_SUCCESS) ;
@@ -1343,13 +1314,10 @@ int LG_RpqPath_Traverse
         {
             if (work->A[a] == NULL || work->N[a] == NULL) continue ;
 
-            // H[p,j] = {q | N_a[q,p] && frontier[q,j]} for a direct query.
-            // Inverse queries instead follow the original N_a rows.  REPLACE
-            // discards the previous label's H values; frontier is only read.
-            GrB_Descriptor nfa_direction = work->inverse ?
-                GrB_DESC_R : GrB_DESC_RT0 ;
+            // H[p,j] = {q | N_a[q,p] && frontier[q,j]}.  REPLACE discards
+            // the previous label's H values; frontier is only read.
             info = GrB_mxm (H, NULL, NULL, ops.state_semiring,
-                work->N[a], frontier, nfa_direction) ;
+                work->N[a], frontier, GrB_DESC_RT0) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
             // An inactive label contributes nothing.  Skip its product before
             // the backend prepares the graph operand for multiplication.
@@ -1357,13 +1325,10 @@ int LG_RpqPath_Traverse
             info = GrB_Matrix_nvals (&h_nvals, H) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
             if (h_nvals == 0) continue ;
-            // Accumulate into C; H's column j identifies the predecessor vertex
-            // even when the graph operand is transposed.
-            info = GrB_Descriptor_set (ops.predecessor_product, GrB_INP1,
-                work->reverse_graph[a] ? GrB_TRAN : GrB_DEFAULT) ;
-            if (info != GrB_SUCCESS) goto iteration_cleanup ;
+            // The caller supplies graph directions.  Use AUTO multiplication;
+            // H's column j identifies the predecessor vertex.
             info = GrB_mxm (C, NULL, ops.predecessor_union, label_ops[a].semiring,
-                H, work->A[a], ops.predecessor_product) ;
+                H, work->A[a], NULL) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
         }
 
@@ -2360,7 +2325,6 @@ static int LG_RpqPath_Process
  *     NULL on error/empty result.  Must not hold an unreleased array on entry.
  * @param[out] path_count Non-NULL address receiving the result count, or zero.
  * @param[in] R Borrowed NFA decomposition of nl possibly NULL label slots.
- * @param[in] inverse_labels Non-NULL array of nl graph-direction flags.
  * @param[in] nl Number of shared label slots; positive.
  * @param[in] QS Initial NFA state array; NULL allowed if nqs=0.
  * @param[in] nqs Number of entries in QS.
@@ -2369,7 +2333,6 @@ static int LG_RpqPath_Process
  * @param[in] G Borrowed graph decomposition of nl possibly NULL label slots.
  * @param[in] S Source vertex array; NULL allowed if ns=0.
  * @param[in] ns Number of entries in S.
- * @param[in] inverse Reverse the NFA and toggle every label's graph direction.
  * @param[in] reconstruct Non-NULL semantics-specific reconstruction driver.
  * @param[out] msg Optional buffer of at least LAGRAPH_MSG_LEN bytes, cleared
  *     on entry.  May be NULL.
@@ -2381,7 +2344,6 @@ static int LG_RpqPath_Query
     LAGraph_RpqPath **paths,
     size_t *path_count,
     LAGraph_Graph *R,
-    const bool *inverse_labels,
     size_t nl,
     const GrB_Index *QS,
     size_t nqs,
@@ -2390,7 +2352,6 @@ static int LG_RpqPath_Query
     LAGraph_Graph *G,
     const GrB_Index *S,
     size_t ns,
-    bool inverse,
     LG_RpqPath_ReconstructFn reconstruct,
     char *msg
 )
@@ -2405,8 +2366,7 @@ static int LG_RpqPath_Query
         .allocations = ATOMIC_VAR_INIT (NULL),
         .error = ATOMIC_VAR_INIT (GrB_SUCCESS)
     } ;
-    int info = LG_RpqPath_Init (&work, R, inverse_labels, nl,
-        G, inverse, msg) ;
+    int info = LG_RpqPath_Init (&work, R, nl, G, msg) ;
     if (info != GrB_SUCCESS) goto query_cleanup ;
     info = GrB_Matrix_new (&roots, GrB_BOOL, work->nr, work->ng) ;
     if (info != GrB_SUCCESS) goto query_cleanup ;
@@ -2444,7 +2404,6 @@ int LAGraph_2RpqPath_AllPaths
     LAGraph_RpqPath **paths,
     size_t *path_count,
     LAGraph_Graph *R,
-    const bool *inverse_labels,
     size_t nl,
     const GrB_Index *QS,
     size_t nqs,
@@ -2453,12 +2412,11 @@ int LAGraph_2RpqPath_AllPaths
     LAGraph_Graph *G,
     const GrB_Index *S,
     size_t ns,
-    bool inverse,
     char *msg
 )
 {
-    return (LG_RpqPath_Query (paths, path_count, R, inverse_labels, nl,
-        QS, nqs, QF, nqf, G, S, ns, inverse, LG_RpqPath_ReconstructAll, msg)) ;
+    return (LG_RpqPath_Query (paths, path_count, R, nl,
+        QS, nqs, QF, nqf, G, S, ns, LG_RpqPath_ReconstructAll, msg)) ;
 }
 
 // See LAGraphX.h for the public contract and argument documentation.
@@ -2467,7 +2425,6 @@ int LAGraph_2RpqPath_AllSimple
     LAGraph_RpqPath **paths,
     size_t *path_count,
     LAGraph_Graph *R,
-    const bool *inverse_labels,
     size_t nl,
     const GrB_Index *QS,
     size_t nqs,
@@ -2476,12 +2433,11 @@ int LAGraph_2RpqPath_AllSimple
     LAGraph_Graph *G,
     const GrB_Index *S,
     size_t ns,
-    bool inverse,
     char *msg
 )
 {
-    return (LG_RpqPath_Query (paths, path_count, R, inverse_labels, nl,
-        QS, nqs, QF, nqf, G, S, ns, inverse, LG_RpqPath_ReconstructSimple, msg)) ;
+    return (LG_RpqPath_Query (paths, path_count, R, nl,
+        QS, nqs, QF, nqf, G, S, ns, LG_RpqPath_ReconstructSimple, msg)) ;
 }
 
 // See LAGraphX.h for the public contract and argument documentation.
@@ -2490,7 +2446,6 @@ int LAGraph_2RpqPath_AllTrails
     LAGraph_RpqPath **paths,
     size_t *path_count,
     LAGraph_Graph *R,
-    const bool *inverse_labels,
     size_t nl,
     const GrB_Index *QS,
     size_t nqs,
@@ -2499,12 +2454,11 @@ int LAGraph_2RpqPath_AllTrails
     LAGraph_Graph *G,
     const GrB_Index *S,
     size_t ns,
-    bool inverse,
     char *msg
 )
 {
-    return (LG_RpqPath_Query (paths, path_count, R, inverse_labels, nl,
-        QS, nqs, QF, nqf, G, S, ns, inverse, LG_RpqPath_ReconstructTrails, msg)) ;
+    return (LG_RpqPath_Query (paths, path_count, R, nl,
+        QS, nqs, QF, nqf, G, S, ns, LG_RpqPath_ReconstructTrails, msg)) ;
 }
 
 // See LAGraphX.h for the public contract and argument documentation.
@@ -2513,7 +2467,6 @@ int LAGraph_2RpqPath_AllShortestPaths
     LAGraph_RpqPath **paths,
     size_t *path_count,
     LAGraph_Graph *R,
-    const bool *inverse_labels,
     size_t nl,
     const GrB_Index *QS,
     size_t nqs,
@@ -2522,12 +2475,11 @@ int LAGraph_2RpqPath_AllShortestPaths
     LAGraph_Graph *G,
     const GrB_Index *S,
     size_t ns,
-    bool inverse,
     char *msg
 )
 {
-    return (LG_RpqPath_Query (paths, path_count, R, inverse_labels, nl,
-        QS, nqs, QF, nqf, G, S, ns, inverse, LG_RpqPath_ReconstructShortest, msg)) ;
+    return (LG_RpqPath_Query (paths, path_count, R, nl,
+        QS, nqs, QF, nqf, G, S, ns, LG_RpqPath_ReconstructShortest, msg)) ;
 }
 
 

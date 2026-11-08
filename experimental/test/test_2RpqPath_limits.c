@@ -5,9 +5,9 @@
 
 #define COUNT(a) (sizeof(a) / sizeof((a)[0]))
 typedef struct { GrB_Index from; size_t label; GrB_Index to; } Edge;
-typedef int (*Query)(LAGraph_RpqPath **, size_t *, LAGraph_Graph *, const bool *,
+typedef int (*Query)(LAGraph_RpqPath **, size_t *, LAGraph_Graph *,
     size_t, const GrB_Index *, size_t, const GrB_Index *, size_t,
-    LAGraph_Graph *, const GrB_Index *, size_t, bool, char *);
+    LAGraph_Graph *, const GrB_Index *, size_t, char *);
 static char msg[LAGRAPH_MSG_LEN];
 
 static uint64_t element(const LAGraph_RpqPath *path, size_t slot)
@@ -69,10 +69,9 @@ static void test_length_bound(void)
     TEST_ASSERT(LAGraph_Init(msg) == GrB_SUCCESS);
     build(G,1,graph,COUNT(graph)); build(R,4,nfa,COUNT(nfa));
     const GrB_Index QS[] = {0}, QF[] = {0}, S[] = {0};
-    const bool inverse[] = {false,false,false};
     LAGraph_RpqPath *paths = NULL; size_t count = 0;
-    TEST_ASSERT(LAGraph_2RpqPath_AllPaths(&paths,&count,R,inverse,3,
-        QS,1,QF,1,G,S,1,false,msg) == GrB_SUCCESS);
+    TEST_ASSERT(LAGraph_2RpqPath_AllPaths(&paths,&count,R,3,
+        QS,1,QF,1,G,S,1,msg) == GrB_SUCCESS);
     TEST_CHECK(count == 3);
     bool seen[3] = {false,false,false};
     for (size_t k = 0; k < count; k++)
@@ -101,14 +100,13 @@ static void test_count_bound(void)
     TEST_ASSERT(LAGraph_Init(msg) == GrB_SUCCESS);
     build(G,7,graph,COUNT(graph)); build(R,3,nfa,COUNT(nfa));
     const GrB_Index QS[] = {0}, QF[] = {1,2,1}, S[] = {0};
-    const bool inverse[] = {false,false,false};
     Query queries[] = {LAGraph_2RpqPath_AllPaths,LAGraph_2RpqPath_AllSimple,
         LAGraph_2RpqPath_AllTrails,LAGraph_2RpqPath_AllShortestPaths};
     for (size_t mode = 0; mode < COUNT(queries); mode++)
     {
         LAGraph_RpqPath *paths = NULL; size_t count = 0;
-        TEST_ASSERT(queries[mode](&paths,&count,R,inverse,3,
-            QS,1,QF,3,G,S,1,false,msg) == GrB_SUCCESS);
+        TEST_ASSERT(queries[mode](&paths,&count,R,3,
+            QS,1,QF,3,G,S,1,msg) == GrB_SUCCESS);
         TEST_CHECK(count == 4);
         for (size_t k = 0; k < count; k++)
         {
@@ -135,10 +133,9 @@ static void test_shortest_early_stop(void)
     TEST_ASSERT(LAGraph_Init(msg) == GrB_SUCCESS);
     build(G,6,graph,COUNT(graph)); build(R,4,nfa,COUNT(nfa));
     const GrB_Index QS[] = {0}, QF[] = {2,3}, S[] = {0};
-    const bool inverse[] = {false,false,false};
     LAGraph_RpqPath *paths = NULL; size_t count = 0;
-    TEST_ASSERT(LAGraph_2RpqPath_AllShortestPaths(&paths,&count,R,inverse,3,
-        QS,1,QF,2,G,S,1,false,msg) == GrB_SUCCESS);
+    TEST_ASSERT(LAGraph_2RpqPath_AllShortestPaths(&paths,&count,R,3,
+        QS,1,QF,2,G,S,1,msg) == GrB_SUCCESS);
     TEST_CHECK(count == 4);
     bool seen[4] = {false,false,false,false};
     for (size_t k = 0; k < count; k++)
@@ -168,10 +165,9 @@ static void test_recursive_cycle_count_cap(void)
     TEST_ASSERT(LAGraph_Init(msg) == GrB_SUCCESS);
     build(G,2,graph,COUNT(graph)); build(R,2,nfa,COUNT(nfa));
     const GrB_Index QS[] = {0}, QF[] = {1}, S[] = {0};
-    const bool inverse[] = {false,false,false};
     LAGraph_RpqPath *paths = NULL; size_t count = 0;
-    TEST_ASSERT(LAGraph_2RpqPath_AllPaths(&paths,&count,R,inverse,3,
-        QS,1,QF,1,G,S,1,false,msg) == GrB_SUCCESS);
+    TEST_ASSERT(LAGraph_2RpqPath_AllPaths(&paths,&count,R,3,
+        QS,1,QF,1,G,S,1,msg) == GrB_SUCCESS);
     TEST_ASSERT(count == 4);
     bool seen[4] = {false,false,false,false};
     for (size_t k = 0; k < count; k++)

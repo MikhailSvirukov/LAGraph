@@ -13,7 +13,7 @@
 // All diagrams and input arrays use zero-based indices.  Labels a, b, c map to
 // 0, 1, 2.  [v] marks a graph source; -->q marks an initial NFA state;
 // ((q)) marks an accepting state.  Arrows in diagrams show stored edge
-// directions; inverse-query flags are stated explicitly where they apply.
+// directions; caller-side matrix transpositions are stated where they apply.
 typedef struct
 {
     GrB_Index from ;
@@ -33,9 +33,9 @@ ExpectedPath ;
 typedef int (*TestQueryFunction)
 (
     LAGraph_RpqPath **paths, size_t *path_count,
-    LAGraph_Graph *R, const bool *inverse_labels, size_t nl,
+    LAGraph_Graph *R, size_t nl,
     const GrB_Index *QS, size_t nqs, const GrB_Index *QF, size_t nqf,
-    LAGraph_Graph *G, const GrB_Index *S, size_t ns, bool inverse, char *msg
+    LAGraph_Graph *G, const GrB_Index *S, size_t ns, char *msg
 ) ;
 
 typedef struct
@@ -45,8 +45,8 @@ typedef struct
     size_t graph_edge_count, automaton_edge_count ;
     GrB_Index QS [4], QF [4], S [4] ;
     size_t nqs, nqf, ns ;
-    bool inverse_labels [TEST_LABELS] ;
-    bool inverse ;
+    bool transpose_graph [TEST_LABELS] ; // caller-side input preparation
+    bool transpose_automaton ;
     const ExpectedPath *expected ;
     size_t expected_count ;
     TestQueryFunction run ;          // NULL selects AllPaths for existing cases
@@ -123,9 +123,24 @@ static void test_run_query
 
     TestQueryFunction run = query->run == NULL ?
         LAGraph_2RpqPath_AllPaths : query->run ;
-    int info = run (paths, count, R,
-        query->inverse_labels, TEST_LABELS, query->QS, query->nqs,
-        query->QF, query->nqf, G, query->S, query->ns, query->inverse, msg) ;
+    // Prepare owned input matrices before calling the direction-agnostic API.
+    for (size_t a = 0 ; a < TEST_LABELS ; a++)
+    {
+        if (G[a] != NULL && query->transpose_graph[a])
+        {
+            TEST_ASSERT (GrB_transpose (G[a]->A, NULL, NULL,
+                G[a]->A, NULL) == GrB_SUCCESS) ;
+            TEST_ASSERT (GrB_Matrix_wait (G[a]->A, GrB_MATERIALIZE) == GrB_SUCCESS) ;
+        }
+        if (R[a] != NULL && query->transpose_automaton)
+        {
+            TEST_ASSERT (GrB_transpose (R[a]->A, NULL, NULL,
+                R[a]->A, NULL) == GrB_SUCCESS) ;
+            TEST_ASSERT (GrB_Matrix_wait (R[a]->A, GrB_MATERIALIZE) == GrB_SUCCESS) ;
+        }
+    }
+    int info = run (paths, count, R, TEST_LABELS, query->QS, query->nqs,
+        query->QF, query->nqf, G, query->S, query->ns, msg) ;
     TEST_ASSERT_ (info == GrB_SUCCESS, "RPQ query info=%d: %s", info, msg) ;
     for (size_t a = 0 ; a < TEST_LABELS ; a++)
     {
@@ -629,10 +644,10 @@ static void test_rejected_word (void)
  * Graph:  [0] -a-> 1 <-b- 2
  * NFA:   -->q0 -a-> q1 -b-> ((q2))
  *
- * inverse_labels[b]=true.  The returned traversal is 0 -a-> 1 -b-> 2;
+ * The caller transposes graph label b.  The returned traversal is 0 -a-> 1 -b-> 2;
  * the label index remains b although its graph edge is traversed backwards.
  */
-static void test_inverse_label (void)
+static void test_prepared_label (void)
 {
     const TestEdge graph [] =
     {
@@ -657,7 +672,7 @@ static void test_inverse_label (void)
         .QS = { 0 }, .nqs = 1,
         .QF = { 2 }, .nqf = 1,
         .S = { 0 }, .ns = 1,
-        .inverse_labels = { false, true, false },
+        .transpose_graph = { false, true, false },
         .expected = expected,
         .expected_count = ARRAY_COUNT (expected)
     } ;
@@ -668,10 +683,10 @@ static void test_inverse_label (void)
  * Graph:   0 -a-> 1 -b-> [2]
  * NFA:   ((q0)) -a-> q1 -b-> q2 <-- initial
  *
- * inverse=true, QS={q2}, QF={q0}, S={2}.
- * The query traverses both decompositions backwards and returns 2 -b-> 1 -a-> 0.
+ * The caller transposes graph and NFA matrices; QS={q2}, QF={q0}, S={2}.
+ * The query follows the prepared decompositions and returns 2 -b-> 1 -a-> 0.
  */
-static void test_inverse_query (void)
+static void test_prepared_destination (void)
 {
     const TestEdge graph [] =
     {
@@ -696,7 +711,8 @@ static void test_inverse_query (void)
         .QS = { 2 }, .nqs = 1,
         .QF = { 0 }, .nqf = 1,
         .S = { 2 }, .ns = 1,
-        .inverse = true,
+        .transpose_graph = { true, true, true },
+        .transpose_automaton = true,
         .expected = expected,
         .expected_count = ARRAY_COUNT (expected)
     } ;
@@ -707,10 +723,10 @@ static void test_inverse_query (void)
  * Graph:   0 -a-> 1 <-b- [2]
  * NFA:   ((q0)) -a-> q1 -b-> q2 <-- initial
  *
- * inverse=true and inverse_labels[b]=true: the two reversals cancel for b.
+ * The caller transposes graph label a and the NFA; label b stays as stored.
  * The returned traversal is 2 -b-> 1 -a-> 0.
  */
-static void test_inverse_query_and_label (void)
+static void test_prepared_mixed_directions (void)
 {
     const TestEdge graph [] =
     {
@@ -735,8 +751,8 @@ static void test_inverse_query_and_label (void)
         .QS = { 2 }, .nqs = 1,
         .QF = { 0 }, .nqf = 1,
         .S = { 2 }, .ns = 1,
-        .inverse_labels = { false, true, false },
-        .inverse = true,
+        .transpose_graph = { true, false, true },
+        .transpose_automaton = true,
         .expected = expected,
         .expected_count = ARRAY_COUNT (expected)
     } ;
@@ -1390,10 +1406,10 @@ static void test_trails_different_targets (void)
  * Graph: [0] -a-> 1        [0] -b-> 1
  * NFA:  -->q0 -a-> q1 -b-> ((q2))
  *
- * Trails, inverse_labels[b]=true: 0-a-1-b-0 is a valid closed trail.
+ * Trails: the caller transposes graph label b; 0-a-1-b-0 is a valid closed trail.
  * The reverse traversal of b is distinct from the forward traversal of a.
  */
-static void test_trails_inverse_label (void)
+static void test_trails_prepared_label (void)
 {
     const TestEdge graph [] =
     {
@@ -1418,7 +1434,7 @@ static void test_trails_inverse_label (void)
         .QS = { 0 }, .nqs = 1,
         .QF = { 2 }, .nqf = 1,
         .S = { 0 }, .ns = 1,
-        .inverse_labels = { false, true, false },
+        .transpose_graph = { false, true, false },
         .expected = expected,
         .expected_count = ARRAY_COUNT (expected),
         .run = LAGraph_2RpqPath_AllTrails
@@ -1803,10 +1819,11 @@ static void test_shortest_rejected_shortcut (void)
  * Graph: 0 -a-> 1 <-b- [2]
  * NFA: ((q0)) -a-> q1 -b-> q2 <-- initial
  *
- * Shortest, inverse=true, inverse_labels[b]=true, QS={q2}, QF={q0}, S={2}.
+ * Shortest: the caller transposes graph label a and the NFA,
+ * with QS={q2}, QF={q0}, S={2}.
  * The accepted shortest path in query traversal order is 2-b-1-a-0.
  */
-static void test_shortest_inverse_query (void)
+static void test_shortest_prepared_destination (void)
 {
     const TestEdge graph [] =
     {
@@ -1831,8 +1848,8 @@ static void test_shortest_inverse_query (void)
         .QS = { 2 }, .nqs = 1,
         .QF = { 0 }, .nqf = 1,
         .S = { 2 }, .ns = 1,
-        .inverse_labels = { false, true, false },
-        .inverse = true,
+        .transpose_graph = { true, false, true },
+        .transpose_automaton = true,
         .expected = expected,
         .expected_count = ARRAY_COUNT (expected),
         .run = LAGraph_2RpqPath_AllShortestPaths
@@ -2061,15 +2078,14 @@ static void test_semantics_backtracking (void)
     test_build_decomposition (G, target + 1, graph, edges) ;
     test_build_decomposition (R, 2, automaton, ARRAY_COUNT (automaton)) ;
     const GrB_Index QS [] = { 0 }, QF [] = { 1, 1 }, S [] = { 0 } ;
-    const bool inverse_labels [TEST_LABELS] = { false } ;
     TestQueryFunction modes [] =
         { LAGraph_2RpqPath_AllSimple, LAGraph_2RpqPath_AllTrails } ;
     for (size_t mode = 0 ; mode < ARRAY_COUNT (modes) ; mode++)
     {
         LAGraph_RpqPath *paths = NULL ;
         size_t count = 0 ;
-        TEST_ASSERT (modes[mode] (&paths, &count, R, inverse_labels, TEST_LABELS,
-            QS, 1, QF, 2, G, S, 1, false, msg) == GrB_SUCCESS) ;
+        TEST_ASSERT (modes[mode] (&paths, &count, R, TEST_LABELS,
+            QS, 1, QF, 2, G, S, 1, msg) == GrB_SUCCESS) ;
         TEST_CHECK (count == 2) ;
         bool seen [2] = { false } ;
         for (size_t k = 0 ; k < count ; k++)
@@ -2198,9 +2214,9 @@ TEST_LIST =
     { "RpqPath_zero_length", test_zero_length },
     { "RpqPath_no_shared_label", test_no_shared_label },
     { "RpqPath_rejected_word", test_rejected_word },
-    { "RpqPath_inverse_label", test_inverse_label },
-    { "RpqPath_inverse_query", test_inverse_query },
-    { "RpqPath_inverse_query_and_label", test_inverse_query_and_label },
+    { "RpqPath_prepared_label", test_prepared_label },
+    { "RpqPath_prepared_destination", test_prepared_destination },
+    { "RpqPath_prepared_mixed_directions", test_prepared_mixed_directions },
     { "RpqPath_cycle_in_graph", test_cycle_in_graph },
     { "RpqPath_repeated_edge", test_repeated_edge },
     { "RpqPath_long_chain", test_long_chain },
@@ -2220,7 +2236,7 @@ TEST_LIST =
     { "RpqPath_trails_repeated_edge", test_trails_repeated_edge },
     { "RpqPath_trails_self_loop_once", test_trails_self_loop_once },
     { "RpqPath_trails_different_targets", test_trails_different_targets },
-    { "RpqPath_trails_inverse_label", test_trails_inverse_label },
+    { "RpqPath_trails_prepared_label", test_trails_prepared_label },
     { "RpqPath_shortest_equal_branches", test_shortest_equal_branches },
     { "RpqPath_shortest_per_destination", test_shortest_per_destination },
     { "RpqPath_shortest_later_final_state", test_shortest_later_final_state },
@@ -2230,7 +2246,7 @@ TEST_LIST =
     { "RpqPath_shortest_root_and_cycle", test_shortest_root_and_cycle },
     { "RpqPath_shortest_requires_repeated_edge", test_shortest_requires_repeated_edge },
     { "RpqPath_shortest_rejected_shortcut", test_shortest_rejected_shortcut },
-    { "RpqPath_shortest_inverse_query", test_shortest_inverse_query },
+    { "RpqPath_shortest_prepared_destination", test_shortest_prepared_destination },
     { "RpqPath_shortest_no_path", test_shortest_no_path },
     { "RpqPath_shortest_late_shorter_and_tie", test_shortest_late_shorter_and_tie },
     { NULL, NULL }
