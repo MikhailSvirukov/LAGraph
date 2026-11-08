@@ -1121,12 +1121,13 @@ static int LG_RpqPath_CreatePredecessorOperators
         "LG_RpqPath_CollectPredecessors", NULL) ;
     if (info != GrB_SUCCESS) return (info) ;
 
-    // Let GraphBLAS choose the product method.  Its SAXPY paths require the
-    // fix for workspace sizes and casts of generic flipped indexed operators.
+    // The benchmark uses inverse queries for single-destination searches.
+    // Choose by query direction, including when individual labels are reversed.
+    // Both methods require the generic flipped indexed SAXPY fix in GraphBLAS.
     info = GrB_Descriptor_new (&ops->predecessor_product) ;
     if (info != GrB_SUCCESS) return (info) ;
     info = GrB_Descriptor_set (ops->predecessor_product,
-        GxB_AxB_METHOD, GrB_DEFAULT) ;
+        GxB_AxB_METHOD, work->inverse ? GxB_AxB_HASH : GxB_AxB_SAXPY) ;
     if (info != GrB_SUCCESS) return (info) ;
 
     return (GrB_SUCCESS) ;
