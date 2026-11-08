@@ -1123,11 +1123,11 @@ static int LG_RpqPath_CreatePredecessorOperators
 
     // The benchmark uses inverse queries for single-destination searches.
     // Choose by query direction, including when individual labels are reversed.
-    // Both methods require the generic flipped indexed SAXPY fix in GraphBLAS.
+    // SAXPY requires the generic flipped indexed operator fix in GraphBLAS.
     info = GrB_Descriptor_new (&ops->predecessor_product) ;
     if (info != GrB_SUCCESS) return (info) ;
     info = GrB_Descriptor_set (ops->predecessor_product,
-        GxB_AxB_METHOD, work->inverse ? GxB_AxB_HASH : GxB_AxB_SAXPY) ;
+        GxB_AxB_METHOD, work->inverse ? GxB_AxB_DOT : GxB_AxB_SAXPY) ;
     if (info != GrB_SUCCESS) return (info) ;
 
     return (GrB_SUCCESS) ;
