@@ -23,6 +23,7 @@
 #include "LG_internal.h"
 #include "LAGraphX.h"
 #include <stdatomic.h>
+#include "LG_RpqPath_profile.h"
 
 // Input correctness is the caller's responsibility.
 
@@ -200,6 +201,7 @@ typedef struct
 {
     _Atomic (LG_RpqPath_PredecessorBlock *) allocations ;
     atomic_int error ;
+    LG_RpqPath_Profile *profile ;
 }
 LG_RpqPath_BlockPool ;
 
@@ -237,6 +239,7 @@ static LG_RpqPath_PredecessorBlock *LG_RpqPath_PoolAcquire
         atomic_store (&pool->error, GrB_OUT_OF_MEMORY) ;
         return (NULL) ;
     }
+    LG_RpqPath_ProfileAdd (pool->profile, LG_RPQ_temp_allocations, 1) ;
     block->count = 0 ;
     block->next = NULL ;
     LG_RpqPath_PredecessorBlock *head = atomic_load (&pool->allocations) ;
@@ -378,6 +381,7 @@ static void LG_RpqPath_UnionPredecessors (void *z, const void *x, const void *y)
     const LG_RpqPath_PredecessorBlock *left_block = left.head ;
     const LG_RpqPath_PredecessorBlock *right_block = right.head ;
     size_t left_index = 0, right_index = 0 ;
+    uint64_t written = 0, duplicates = 0 ;
 
     if (atomic_load (&result.pool->error) == GrB_SUCCESS)
     {
@@ -407,11 +411,13 @@ static void LG_RpqPath_UnionPredecessors (void *z, const void *x, const void *y)
                 {
                     LG_RpqPath_TemporaryAdvance (&left_block, &left_index) ;
                 }
+                if (order == 0) duplicates++ ;
                 if (order >= 0)
                 {
                     LG_RpqPath_TemporaryAdvance (&right_block, &right_index) ;
                 }
             }
+            written++ ;
             if (!LG_RpqPath_TemporaryAppend (&result, &tail, record))
             {
                 // Partial output remains in the arena until iteration reset.
@@ -420,6 +426,10 @@ static void LG_RpqPath_UnionPredecessors (void *z, const void *x, const void *y)
             }
         }
     }
+    LG_RpqPath_ProfileAdd (result.pool->profile, LG_RPQ_union_calls, 1) ;
+    LG_RpqPath_ProfileAdd (result.pool->profile, LG_RPQ_union_input_records, written + duplicates) ;
+    LG_RpqPath_ProfileAdd (result.pool->profile, LG_RPQ_union_duplicates, duplicates) ;
+    LG_RpqPath_ProfileAdd (result.pool->profile, LG_RPQ_temp_records_written, written) ;
     *(LG_RpqPath_TemporarySet *) z = result ;
 }
 
@@ -491,6 +501,10 @@ static void LG_RpqPath_CollectPredecessors
             }
         }
     }
+    LG_RpqPath_ProfileAdd (context->pool->profile, LG_RPQ_product_calls, 1) ;
+    size_t produced = *(const bool *) y ? states->count : 0 ;
+    LG_RpqPath_ProfileAdd (context->pool->profile, LG_RPQ_product_records, produced) ;
+    LG_RpqPath_ProfileAdd (context->pool->profile, LG_RPQ_temp_records_written, produced) ;
     *(LG_RpqPath_TemporarySet *) z = result ;
 }
 
@@ -529,6 +543,7 @@ typedef struct
 {
     _Atomic (LG_RpqPath_StoredAllocation *) allocations ;
     atomic_int error ;
+    LG_RpqPath_Profile *profile ;
 }
 LG_RpqPath_StoredOwner ;
 
@@ -538,6 +553,175 @@ typedef struct
     LG_RpqPath_StoredOwner *owner ;
 }
 LG_RpqPath_StoredContext ;
+
+// Matrix snapshots run only after materialization, outside operation timers.
+// kind: 0 BOOL, 1 H state sets, 2 C temporary sets, 3 P stored sets.
+static int LG_RpqPath_ProfilePointerOrder (const void *a, const void *b)
+{
+    uintptr_t x = (uintptr_t) *(const void *const *) a ;
+    uintptr_t y = (uintptr_t) *(const void *const *) b ;
+    return (x > y) - (x < y) ;
+}
+static void LG_RpqPath_ProfileMatrix (LG_RpqPath_Profile *p,
+    const char *name, GrB_Matrix matrix, int kind)
+{
+    if (p == NULL || matrix == NULL) return ;
+    double start = LAGraph_WallClockTime () ;
+    GrB_Index nvals = 0, rows = 0, cols = 0 ;
+    size_t bytes = 0 ;
+    int32_t format = 0, sparsity = 0 ;
+    GxB_Iterator it = NULL ;
+    void *value = NULL ;
+    const void **blocks = NULL ;
+    size_t block_count = 0, block_capacity = 0 ;
+    uint64_t records = 0, nonempty = 0, max_records = 0, chain_sum = 0, chain_max = 0 ;
+    int info = GrB_Matrix_nvals (&nvals, matrix) ;
+    if (info != GrB_SUCCESS) goto snapshot_end ;
+    info = GrB_Matrix_nrows (&rows, matrix) ;
+    if (info != GrB_SUCCESS) goto snapshot_end ;
+    info = GrB_Matrix_ncols (&cols, matrix) ;
+    if (info != GrB_SUCCESS) goto snapshot_end ;
+    info = GxB_Matrix_memoryUsage (&bytes, matrix) ;
+    if (info != GrB_SUCCESS) goto snapshot_end ;
+    info = GxB_Matrix_Option_get_INT32 (matrix, GxB_FORMAT, &format) ;
+    if (info != GrB_SUCCESS) goto snapshot_end ;
+    info = GxB_Matrix_Option_get_INT32 (matrix, GxB_SPARSITY_STATUS, &sparsity) ;
+    if (info != GrB_SUCCESS) goto snapshot_end ;
+    size_t value_size = kind == 1 ? sizeof (LG_RpqPath_StateSet) + rows * sizeof (GrB_Index) :
+        kind == 2 ? sizeof (LG_RpqPath_TemporarySet) : sizeof (LG_RpqPath_StoredSet) ;
+    value = malloc (value_size) ;
+    if (value == NULL) { info = GrB_OUT_OF_MEMORY ; goto snapshot_end ; }
+    info = GxB_Iterator_new (&it) ;
+    if (info != GrB_SUCCESS) goto snapshot_end ;
+    info = GxB_Matrix_Iterator_attach (it, matrix, NULL) ;
+    if (info != GrB_SUCCESS) goto snapshot_end ;
+    for (info = GxB_Matrix_Iterator_seek (it, 0) ; info == GrB_SUCCESS ;
+         info = GxB_Matrix_Iterator_next (it))
+    {
+        uint64_t count = 0, chain = 0 ;
+        if (kind == 0) count = GxB_Iterator_get_BOOL (it) ? 1 : 0 ;
+        else
+        {
+            GxB_Iterator_get_UDT (it, value) ;
+            if (kind == 1) count = ((LG_RpqPath_StateSet *) value)->count ;
+            else if (kind == 2)
+            {
+                for (const LG_RpqPath_PredecessorBlock *b = ((LG_RpqPath_TemporarySet *) value)->head ;
+                     b != NULL ; b = b->next)
+                {
+                    count += b->count ; chain++ ;
+                    if (block_count == block_capacity)
+                    {
+                        if (block_capacity > SIZE_MAX / 2 / sizeof (*blocks))
+                        { info = GrB_OUT_OF_MEMORY ; goto snapshot_end ; }
+                        size_t cap = block_capacity == 0 ? 64 : 2 * block_capacity ;
+                        const void **grown = realloc (blocks, cap * sizeof (*blocks)) ;
+                        if (grown == NULL) { info = GrB_OUT_OF_MEMORY ; goto snapshot_end ; }
+                        blocks = grown ; block_capacity = cap ;
+                    }
+                    blocks[block_count++] = b ;
+                }
+            }
+            else
+            {
+                const LG_RpqPath_StoredSet *set = value ; count = set->count ;
+                for (const LG_RpqPath_StoredAllocation *b = set->allocation ; b != NULL ; b = b->previous) chain++ ;
+            }
+        }
+        records += count ; nonempty += count != 0 ;
+        if (count > max_records) max_records = count ;
+        chain_sum += chain ; if (chain > chain_max) chain_max = chain ;
+    }
+    if (info == GxB_EXHAUSTED) info = GrB_SUCCESS ;
+snapshot_end: ;
+    char key[96] ;
+#define SNAP_U(suffix, n) do { snprintf (key, sizeof (key), "%s_%s", name, suffix) ; LG_RpqPath_ProfileU (p, key, n) ; } while (0)
+    snprintf (key, sizeof (key), "%s_snapshot_status", name) ;
+    LG_RpqPath_ProfileD (p, key, info) ;
+    if (info == GrB_SUCCESS)
+    {
+        SNAP_U ("nvals", nvals) ; SNAP_U ("rows", rows) ; SNAP_U ("cols", cols) ;
+        SNAP_U ("matrix_bytes", bytes) ; SNAP_U ("format", format) ; SNAP_U ("sparsity", sparsity) ;
+        SNAP_U ("records", records) ; SNAP_U ("nonempty", nonempty) ; SNAP_U ("records_max", max_records) ;
+        SNAP_U ("chain_sum", chain_sum) ; SNAP_U ("chain_max", chain_max) ;
+        if (kind == 2)
+        {
+            if (block_count > 1) qsort (blocks, block_count, sizeof (*blocks), LG_RpqPath_ProfilePointerOrder) ;
+            uint64_t unique = 0 ;
+            for (size_t k = 0 ; k < block_count ; k++)
+                if (k == 0 || blocks[k] != blocks[k-1]) unique++ ;
+            SNAP_U ("reachable_blocks", unique) ;
+            SNAP_U ("reachable_bytes", unique * sizeof (LG_RpqPath_PredecessorBlock)) ;
+            SNAP_U ("snapshot_scratch_bytes", block_capacity * sizeof (*blocks) + value_size) ;
+        }
+    }
+    else p->failed = true ;
+#undef SNAP_U
+    GrB_free (&it) ; free (value) ; free (blocks) ;
+    double elapsed = 1000 * (LAGraph_WallClockTime () - start) ;
+    p->stats_ms += elapsed ;
+    snprintf (key, sizeof (key), "%s_snapshot_ms", name) ;
+    LG_RpqPath_ProfileD (p, key, elapsed) ;
+}
+static void LG_RpqPath_ProfilePool (LG_RpqPath_Profile *p, LG_RpqPath_BlockPool *pool)
+{
+    if (p == NULL) return ;
+    double start = LAGraph_WallClockTime () ;
+    uint64_t count = 0, records = 0 ;
+    for (const LG_RpqPath_PredecessorBlock *b = atomic_load (&pool->allocations) ;
+         b != NULL ; b = b->allocation_next) { count++ ; records += b->count ; }
+    LG_RpqPath_ProfileU (p, "pool_blocks", count) ;
+    LG_RpqPath_ProfileU (p, "pool_bytes", count * sizeof (LG_RpqPath_PredecessorBlock)) ;
+    LG_RpqPath_ProfileU (p, "pool_records", records) ;
+    LG_RpqPath_ProfileU (p, "pool_slots", count * LG_RPQ_PATH_BLOCK_CAPACITY) ;
+    p->stats_ms += 1000 * (LAGraph_WallClockTime () - start) ;
+}
+static void LG_RpqPath_ProfileStored (LG_RpqPath_Profile *p, LG_RpqPath_StoredOwner *owner,
+    const LG_RpqPath_StoredAllocation *previous)
+{
+    if (p == NULL) return ;
+    double start = LAGraph_WallClockTime () ;
+    uint64_t count = 0, records = 0, new_count = 0, new_records = 0, min = UINT64_MAX, max = 0 ;
+    uint64_t hist[8] = { 0 } ; bool fresh = true ;
+    for (const LG_RpqPath_StoredAllocation *b = atomic_load (&owner->allocations) ;
+         b != NULL ; b = b->allocation_next)
+    {
+        if (b == previous) fresh = false ;
+        count++ ; records += b->count ;
+        if (!fresh) continue ;
+        new_count++ ; new_records += b->count ;
+        if (b->count < min) min = b->count ;
+        if (b->count > max) max = b->count ;
+        size_t bucket = 0, limit = 1 ;
+        while (bucket < 7 && b->count > limit) { bucket++ ; limit *= 4 ; }
+        hist[bucket]++ ;
+    }
+    LG_RpqPath_ProfileU (p, "P_owned_blocks", count) ;
+    LG_RpqPath_ProfileU (p, "P_owned_records", records) ;
+    LG_RpqPath_ProfileU (p, "P_owned_bytes", count * sizeof (LG_RpqPath_StoredAllocation) + records * sizeof (LG_RpqPath_Predecessor)) ;
+    LG_RpqPath_ProfileU (p, "P_new_blocks", new_count) ;
+    LG_RpqPath_ProfileU (p, "P_new_records", new_records) ;
+    LG_RpqPath_ProfileU (p, "P_new_block_min_records", new_count ? min : 0) ;
+    LG_RpqPath_ProfileU (p, "P_new_block_max_records", max) ;
+    LG_RpqPath_ProfileD (p, "P_new_block_mean_records", new_count ? (double) new_records / new_count : 0) ;
+    for (size_t k = 0 ; k < 8 ; k++)
+    {
+        char key[64] ; snprintf (key, sizeof (key), "P_new_block_bucket_%zu", k) ;
+        LG_RpqPath_ProfileU (p, key, hist[k]) ;
+    }
+    p->stats_ms += 1000 * (LAGraph_WallClockTime () - start) ;
+}
+static void LG_RpqPath_ProfileCounters (LG_RpqPath_Profile *p, bool reset)
+{
+    if (p == NULL) return ;
+    for (int k = 0 ; k < LG_RPQ_COUNTER_COUNT ; k++)
+    {
+        uint64_t value = reset ? atomic_exchange (&p->counters[k], 0) : atomic_load (&p->counters[k]) ;
+        LG_RpqPath_ProfileU (p, LG_RpqPath_CounterNames[k], value) ;
+    }
+}
+
+
 
 /**
  * @brief Allocate one immutable delta block and register its query owner.
@@ -571,6 +755,8 @@ static int LG_RpqPath_StoredAllocate
     LG_RpqPath_StoredAllocation *allocation = NULL ;
     int info = LAGraph_Malloc ((void **) &allocation, 1, bytes, msg) ;
     if (info != GrB_SUCCESS) return (info) ;
+    LG_RpqPath_ProfileAdd (owner->profile, LG_RPQ_p_allocations, 1) ;
+    LG_RpqPath_ProfileAdd (owner->profile, LG_RPQ_p_allocated_bytes, bytes) ;
     allocation->count = capacity ;
     allocation->previous = NULL ;
     // Only the new private node's link changes on a retry.  Existing nodes
@@ -641,28 +827,44 @@ static void LG_RpqPath_BloomBits
 static bool LG_RpqPath_StoredContains
 (
     const LG_RpqPath_StoredSet *stored,
-    const LG_RpqPath_Predecessor *record
+    const LG_RpqPath_Predecessor *record,
+    LG_RpqPath_Profile *profile, bool merging
 )
 {
+    int base = merging ? LG_RPQ_merge_checks : LG_RPQ_front_checks ;
+    LG_RpqPath_ProfileAdd (profile, base, 1) ;
+    uint64_t blocks = 0, comparisons = 0 ;
     uint64_t bits [2] ;
     LG_RpqPath_BloomBits (record, bits) ;
     if ((stored->bloom[0] & bits[0]) != bits[0] ||
-        (stored->bloom[1] & bits[1]) != bits[1]) return (false) ;
+        (stored->bloom[1] & bits[1]) != bits[1])
+    { LG_RpqPath_ProfileAdd (profile, base + 1, 1) ; return (false) ; }
 
     for (const LG_RpqPath_StoredAllocation *block = stored->allocation ;
          block != NULL ; block = block->previous)
     {
+        blocks++ ;
         size_t low = 0, high = block->count ;
         while (low < high)
         {
             size_t mid = low + (high - low) / 2 ;
             int order = LG_RpqPath_ComparePredecessors (
                 record, &block->records[mid]) ;
-            if (order == 0) return (true) ;
+            comparisons++ ;
+            if (order == 0)
+            {
+                LG_RpqPath_ProfileAdd (profile, base + 3, 1) ;
+                LG_RpqPath_ProfileAdd (profile, base + 4, blocks) ;
+                LG_RpqPath_ProfileAdd (profile, base + 5, comparisons) ;
+                return (true) ;
+            }
             if (order < 0) high = mid ;
             else low = mid + 1 ;
         }
     }
+    LG_RpqPath_ProfileAdd (profile, base + 2, 1) ;
+    LG_RpqPath_ProfileAdd (profile, base + 4, blocks) ;
+    LG_RpqPath_ProfileAdd (profile, base + 5, comparisons) ;
     return (false) ;
 }
 
@@ -681,7 +883,7 @@ static void LG_RpqPath_HasNewPredecessors (void *z, const void *x, const void *y
     {
         for (size_t k = 0 ; k < block->count ; k++)
         {
-            if (!LG_RpqPath_StoredContains (stored, &block->records[k]))
+            if (!LG_RpqPath_StoredContains (stored, &block->records[k], temporary->pool->profile, false))
             {
                 *(bool *) z = true ;
                 return ;
@@ -710,7 +912,7 @@ static int LG_RpqPath_MergeStoredSet
 )
 {
     *result = *stored ;
-    size_t added = 0 ;
+    size_t added = 0, incoming = 0 ;
     // Count first so duplicate-heavy updates do not reserve space for old
     // triples.  Recheck against the same immutable snapshot when filling.
     for (const LG_RpqPath_PredecessorBlock *block = temporary->head ;
@@ -718,7 +920,8 @@ static int LG_RpqPath_MergeStoredSet
     {
         for (size_t k = 0 ; k < block->count ; k++)
         {
-            if (LG_RpqPath_StoredContains (stored, &block->records[k])) continue ;
+            incoming++ ;
+            if (LG_RpqPath_StoredContains (stored, &block->records[k], owner->profile, true)) continue ;
             if (added == SIZE_MAX - stored->count)
             {
                 LG_ERROR_MSG ("stored predecessor count exceeds addressable memory") ;
@@ -727,7 +930,11 @@ static int LG_RpqPath_MergeStoredSet
             added++ ;
         }
     }
+    LG_RpqPath_ProfileAdd (owner->profile, LG_RPQ_p_added_records, added) ;
+    LG_RpqPath_ProfileAdd (owner->profile, LG_RPQ_p_duplicate_records, incoming - added) ;
     if (added == 0) return (GrB_SUCCESS) ;
+    LG_RpqPath_ProfileAdd (owner->profile, LG_RPQ_p_changed_cells, 1) ;
+    if (stored->count == 0) LG_RpqPath_ProfileAdd (owner->profile, LG_RPQ_p_new_cells, 1) ;
 
     LG_RpqPath_StoredAllocation *delta = NULL ;
     int info = LG_RpqPath_StoredAllocate (owner, added, &delta, msg) ;
@@ -740,7 +947,7 @@ static int LG_RpqPath_MergeStoredSet
         for (size_t k = 0 ; k < block->count ; k++)
         {
             const LG_RpqPath_Predecessor *record = &block->records[k] ;
-            if (LG_RpqPath_StoredContains (stored, record)) continue ;
+            if (LG_RpqPath_StoredContains (stored, record, owner->profile, true)) continue ;
             delta->records[used++] = *record ;
             uint64_t bits [2] ;
             LG_RpqPath_BloomBits (record, bits) ;
@@ -1248,6 +1455,7 @@ int LG_RpqPath_Traverse
     LG_RpqPath_StoredOwner *P_owner,
     LG_RpqPath_Workspace *work,
     GrB_Matrix roots,
+    LG_RpqPath_Profile *profile,
     char *msg
 )
 {
@@ -1264,7 +1472,7 @@ int LG_RpqPath_Traverse
     LG_RpqPath_StoredOwner stored_owner =
     {
         .allocations = ATOMIC_VAR_INIT (NULL),
-        .error = ATOMIC_VAR_INIT (GrB_SUCCESS)
+        .error = ATOMIC_VAR_INIT (GrB_SUCCESS), .profile = profile
     } ;
 
     GrB_Scalar stored_context = NULL ;
@@ -1277,7 +1485,7 @@ int LG_RpqPath_Traverse
     LG_RpqPath_BlockPool pool =
     {
         .allocations = ATOMIC_VAR_INIT (NULL),
-        .error = ATOMIC_VAR_INIT (GrB_SUCCESS)
+        .error = ATOMIC_VAR_INIT (GrB_SUCCESS), .profile = profile
     } ;
 
     // Setup: create shared operators, per-label bindings, P and the frontier.
@@ -1303,15 +1511,22 @@ int LG_RpqPath_Traverse
         &ops, &stored_owner) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
 
-    info = GrB_Matrix_new (&P, work->stored_set_type, work->nr, work->ng) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
-    info = GrB_Matrix_dup (&frontier, roots) ;
-    if (info != GrB_SUCCESS) goto traversal_cleanup ;
+    LG_RPQ_CALL ("new_P", P, GrB_Matrix_new (&P, work->stored_set_type, work->nr, work->ng), traversal_cleanup) ;
+    LG_RpqPath_ProfileMatrix (profile, "P", P, 3) ;
+    LG_RPQ_CALL ("dup_frontier", frontier, GrB_Matrix_dup (&frontier, roots), traversal_cleanup) ;
+    LG_RpqPath_ProfileMatrix (profile, "frontier", frontier, 0) ;
     info = GrB_Matrix_nvals (&frontier_nvals, frontier) ;
     if (info != GrB_SUCCESS) goto traversal_cleanup ;
 
     while (frontier_nvals != 0)
     {
+        double iteration_start = LG_RpqPath_ProfileClock (profile) ;
+        double stats_before = profile == NULL ? 0 : profile->stats_ms ;
+        const LG_RpqPath_StoredAllocation *previous_allocations = atomic_load (&stored_owner.allocations) ;
+        if (profile != NULL) { profile->iteration++ ; profile->label = -1 ; }
+        LG_RpqPath_ProfileEvent (profile, "begin") ;
+        LG_RpqPath_ProfileMatrix (profile, "frontier", frontier, 0) ;
+        LG_RpqPath_ProfileMatrix (profile, "P", P, 3) ;
         // 1. Create the matrices owned by this iteration.
         GrB_Matrix H = NULL ;
         GrB_Matrix C = NULL ;
@@ -1319,47 +1534,56 @@ int LG_RpqPath_Traverse
 
         bool updating_P = false ;
 
-        info = GrB_Matrix_new (&H, work->state_set_type, work->nr, work->ng) ;
-        if (info != GrB_SUCCESS) goto iteration_cleanup ;
-        info = GrB_Matrix_new (&C, work->temporary_set_type,
-            work->nr, work->ng) ;
-        if (info != GrB_SUCCESS) goto iteration_cleanup ;
-        info = GrB_Matrix_new (&next_frontier, GrB_BOOL, work->nr, work->ng) ;
-        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+        LG_RPQ_CALL ("new_H", H, GrB_Matrix_new (&H, work->state_set_type, work->nr, work->ng), iteration_cleanup) ;
+        LG_RpqPath_ProfileMatrix (profile, "H", H, 1) ;
+        LG_RPQ_CALL ("new_C", C, GrB_Matrix_new (&C, work->temporary_set_type,
+            work->nr, work->ng), iteration_cleanup) ;
+        LG_RpqPath_ProfileMatrix (profile, "C", C, 2) ;
+        LG_RPQ_CALL ("new_next_frontier", next_frontier, GrB_Matrix_new (&next_frontier, GrB_BOOL, work->nr, work->ng), iteration_cleanup) ;
+        LG_RpqPath_ProfileMatrix (profile, "next_frontier", next_frontier, 0) ;
 
         // 2. Build C across labels, using the same input frontier for each.
         for (size_t a = 0 ; a < work->nl ; a++)
         {
-            if (work->A[a] == NULL || work->N[a] == NULL) continue ;
+            if (profile != NULL) profile->label = (int64_t) a ;
+            LG_RpqPath_ProfileEvent (profile, "label") ;
+            if (work->A[a] == NULL || work->N[a] == NULL)
+            { LG_RpqPath_ProfileText (profile, "skip", "missing_matrix") ; continue ; }
 
             // H[p,j] = {q | N_a[q,p] && frontier[q,j]}.  REPLACE discards
             // the previous label's H values; frontier is only read.
-            info = GrB_mxm (H, NULL, NULL, ops.state_semiring,
-                work->N[a], frontier, ops.state_product) ;
-            if (info != GrB_SUCCESS) goto iteration_cleanup ;
+            LG_RPQ_CALL ("mxm1", H, GrB_mxm (H, NULL, NULL, ops.state_semiring,
+                work->N[a], frontier, ops.state_product), iteration_cleanup) ;
+            LG_RpqPath_ProfileMatrix (profile, "H", H, 1) ;
             // An inactive label contributes nothing.  Skip its product before
             // the backend prepares the graph operand for multiplication.
             GrB_Index h_nvals = 0 ;
             info = GrB_Matrix_nvals (&h_nvals, H) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
-            if (h_nvals == 0) continue ;
+            if (h_nvals == 0)
+            { LG_RpqPath_ProfileText (profile, "skip", "empty_H") ; continue ; }
             // The caller supplies graph directions.  Use AUTO multiplication;
             // H's column j identifies the predecessor vertex.
-            info = GrB_mxm (C, NULL, ops.predecessor_union, label_ops[a].semiring,
-                H, work->A[a], ops.predecessor_product) ;
-            if (info != GrB_SUCCESS) goto iteration_cleanup ;
+            LG_RPQ_CALL ("mxm2", C, GrB_mxm (C, NULL, ops.predecessor_union, label_ops[a].semiring,
+                H, work->A[a], ops.predecessor_product), iteration_cleanup) ;
+            LG_RpqPath_ProfileMatrix (profile, "C", C, 2) ;
+            LG_RpqPath_ProfilePool (profile, &pool) ;
         }
 
+        if (profile != NULL) profile->label = -1 ;
+        LG_RpqPath_ProfileEvent (profile, "products_done") ;
+        LG_RpqPath_ProfileMatrix (profile, "C", C, 2) ;
+        LG_RpqPath_ProfilePool (profile, &pool) ;
         // 3. Compute the new frontier against OLD P without a mask.  P-only
         // cells and unchanged candidates produce false; remove those entries
         // before this matrix is used by the next iteration's products.
-        info = GxB_Matrix_eWiseUnion (next_frontier, NULL, NULL,
+        LG_RPQ_CALL ("front_union", next_frontier, GxB_Matrix_eWiseUnion (next_frontier, NULL, NULL,
             ops.has_new_predecessors, C, ops.empty_temporary, P, ops.empty_stored,
-            GrB_DESC_R) ;
-        if (info != GrB_SUCCESS) goto iteration_cleanup ;
-        info = GrB_Matrix_select_BOOL (next_frontier, NULL, NULL,
-            GrB_VALUEEQ_BOOL, next_frontier, true, GrB_DESC_R) ;
-        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+            GrB_DESC_R), iteration_cleanup) ;
+        LG_RpqPath_ProfileMatrix (profile, "next_frontier", next_frontier, 0) ;
+        LG_RPQ_CALL ("front_select", next_frontier, GrB_Matrix_select_BOOL (next_frontier, NULL, NULL,
+            GrB_VALUEEQ_BOOL, next_frontier, true, GrB_DESC_R), iteration_cleanup) ;
+        LG_RpqPath_ProfileMatrix (profile, "next_frontier", next_frontier, 0) ;
         // Selection leaves only true entries, so nvals is the termination
         // test.  It also resolves pending entries before P is updated.
         info = GrB_Matrix_nvals (&frontier_nvals, next_frontier) ;
@@ -1368,24 +1592,33 @@ int LG_RpqPath_Traverse
         // 4. Extend P with one delta block per changed cell.  P-only cells
         // reuse their old handles; eWiseUnion also converts C-only values.
         updating_P = true ;
-        info = GxB_Matrix_eWiseUnion (P, NULL, NULL, stored_merge,
-            C, ops.empty_temporary, P, ops.empty_stored, NULL) ;
-        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+        LG_RPQ_CALL ("P_merge", P, GxB_Matrix_eWiseUnion (P, NULL, NULL, stored_merge,
+            C, ops.empty_temporary, P, ops.empty_stored, NULL), iteration_cleanup) ;
+        LG_RpqPath_ProfileMatrix (profile, "P", P, 3) ;
         info = GrB_Matrix_wait (P, GrB_MATERIALIZE) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
         info = atomic_load (&stored_owner.error) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
 
+        LG_RpqPath_ProfileStored (profile, &stored_owner, previous_allocations) ;
         // 5. All persistent blocks stay query-owned for shared old chains.
         // The P wait allows this iteration's temporary C pool to be reset.
         updating_P = false ;
 
         // Transfer the frontier; cleanup must not free the next input.
+        double free_front_start = LG_RpqPath_ProfileClock (profile) ;
         GrB_free (&frontier) ;
+        if (profile != NULL)
+        {
+            LG_RpqPath_ProfileEvent (profile, "free_frontier") ;
+            LG_RpqPath_ProfileD (profile, "total_ms", 1000 * (LAGraph_WallClockTime () - free_front_start)) ;
+        }
         frontier = next_frontier ;
         next_frontier = NULL ;
 
-iteration_cleanup:
+iteration_cleanup: ;
+        double cleanup_start = LG_RpqPath_ProfileClock (profile) ;
+        LG_RpqPath_ProfileEvent (profile, "iteration_end") ;
         // 6. On success, the frontier nvals and P wait have finished all
         // readers of old P and C.  Only failures need extra cleanup waits.
         // Preserve the first error and check pool.error before resetting it.
@@ -1415,6 +1648,17 @@ iteration_cleanup:
         GrB_free (&C) ;
         GrB_free (&next_frontier) ;
         LG_RpqPath_PoolReset (&pool) ;
+        LG_RpqPath_ProfileCounters (profile, true) ;
+        if (profile != NULL)
+        {
+            LG_RpqPath_ProfileEvent (profile, "iteration_end") ;
+            LG_RpqPath_ProfileD (profile, "cleanup_ms", 1000 * (LAGraph_WallClockTime () - cleanup_start)) ;
+            LG_RpqPath_ProfileD (profile, "iteration_ms", 1000 * (LAGraph_WallClockTime () - iteration_start)) ;
+            LG_RpqPath_ProfileD (profile, "snapshots_ms", profile->stats_ms - stats_before) ;
+            LG_RpqPath_ProfileD (profile, "status", info) ;
+            LG_RpqPath_ProfileU (profile, "frontier_out", frontier_nvals) ;
+            LG_RpqPath_ProfileFlush (profile) ;
+        }
         if (info != GrB_SUCCESS) goto traversal_cleanup ;
     }
 
@@ -1526,8 +1770,54 @@ typedef struct
     LG_RpqPath_CachedNode **output_index ;
     size_t output_capacity ;
     bool shortest ;
+    LG_RpqPath_Profile *profile ;
 }
 LG_RpqPath_Reconstruction ;
+
+// Cumulative progress, sampled at safe points in the single-threaded driver.
+static void LG_RpqPath_ProfileReconstruction (LG_RpqPath_Reconstruction *work, bool force)
+{
+    LG_RpqPath_Profile *p = work->profile ;
+    if (p == NULL || (!force && LAGraph_WallClockTime () < p->next_sample)) return ;
+    double start = LAGraph_WallClockTime () ;
+    p->next_sample = start + 0.1 ;
+    LG_RpqPath_ProfileEvent (p, force ? "final" : "sample") ;
+    p->iteration = ++p->samples ;
+#define RU(n) LG_RpqPath_ProfileU (p, #n, p->n)
+    RU(pairs) ; RU(propagate_calls) ; RU(active_returns) ; RU(max_depth) ;
+    RU(reject_length) ; RU(reject_shortest) ; RU(reject_semantics) ; RU(accepted) ;
+    RU(memo_attempts) ; RU(memo_duplicates) ; RU(prefixes) ; RU(prefix_max) ; RU(path_blocks) ;
+    RU(publish_attempts) ; RU(publish_duplicates) ; RU(published) ;
+    RU(published_length_sum) ; RU(published_length_max) ;
+    RU(loaded_cells) ; RU(dependencies) ; RU(read_blocks) ; RU(read_records) ;
+    RU(activate_steps) ; RU(visit_inserts) ; RU(visit_erases) ; RU(visited_count) ; RU(visited_capacity) ;
+    RU(load_pending) ; RU(load_peak) ; RU(distance_pending) ; RU(distance_peak) ; RU(distance_relaxations) ; RU(targets) ;
+#undef RU
+    LG_RpqPath_ProfileU (p, "memo_cells", work->memo_count) ;
+    LG_RpqPath_ProfileU (p, "answers_before_filter", p->published) ;
+    LG_RpqPath_ProfileU (p, "answers", work->count) ;
+    LG_RpqPath_ProfileU (p, "count_limit", p->count_limit) ;
+    LG_RpqPath_ProfileD (p, "join_ms", p->join_ms) ;
+    LG_RpqPath_ProfileD (p, "memo_ms", p->memo_ms) ;
+    LG_RpqPath_ProfileD (p, "publish_ms", p->publish_ms) ;
+    LG_RpqPath_ProfileD (p, "prepare_ms", p->prepare_ms) ;
+    LG_RpqPath_ProfileD (p, "first_answer_ms", p->first_answer_ms) ;
+    size_t memo_bytes = work->memo_capacity * sizeof (*work->memo) + work->memo_count * sizeof (LG_RpqPath_MemoCell) ;
+    for (size_t k = 0 ; k < work->memo_capacity ; k++)
+        if (work->memo[k] != NULL)
+            memo_bytes += work->memo[k]->capacity * (sizeof (*work->memo[k]->paths) + sizeof (*work->memo[k]->index)) ;
+    size_t result_bytes = work->result == NULL ? 0 : offsetof (LG_RpqPath_Result, paths) +
+        work->result->capacity * sizeof (LG_RpqPath_Path) ;
+    LG_RpqPath_ProfileU (p, "memo_bytes", memo_bytes) ;
+    LG_RpqPath_ProfileU (p, "dependency_bytes", p->dependencies * sizeof (LG_RpqPath_MemoEdge)) ;
+    LG_RpqPath_ProfileU (p, "node_bytes", p->path_blocks * sizeof (LG_RpqPath_PathBlock)) ;
+    LG_RpqPath_ProfileU (p, "result_bytes", result_bytes) ;
+    LG_RpqPath_ProfileU (p, "output_index_bytes", work->output_capacity * sizeof (*work->output_index)) ;
+    LG_RpqPath_ProfileU (p, "visited_bytes", p->visited_bytes) ;
+    LG_RpqPath_ProfileU (p, "profile_buffer_bytes", p->capacity) ;
+    p->stats_ms += 1000 * (LAGraph_WallClockTime () - start) ;
+    LG_RpqPath_ProfileFlush (p) ;
+}
 
 static LG_RpqPath_CachedNode *LG_RpqPath_NodeStorage (const LG_RpqPath_Node *node)
 {
@@ -1679,6 +1969,8 @@ static int LG_RpqPath_MemoExtend
     char *msg
 )
 {
+    LG_RpqPath_Profile *profile = work->profile ;
+    if (profile != NULL) profile->memo_attempts++ ;
     uint64_t hash = LG_RpqPath_Hash (cell->vertex + UINT64_C (0x9e3779b97f4a7c15)) ;
     if (prefix != NULL) hash = LG_RpqPath_Hash (hash ^
         LG_RpqPath_NodeStorage (prefix)->hash ^ LG_RpqPath_Hash (label)) ;
@@ -1688,7 +1980,8 @@ static int LG_RpqPath_MemoExtend
              saved != NULL ; saved = saved->hash_next)
         {
             if (saved->hash == hash && (prefix == NULL || saved->node.label == label) &&
-                LG_RpqPath_EqualNodes (saved->node.prefix, prefix)) return (GrB_SUCCESS) ;
+                LG_RpqPath_EqualNodes (saved->node.prefix, prefix))
+            { if (profile != NULL) profile->memo_duplicates++ ; return (GrB_SUCCESS) ; }
         }
     }
     if (cell->count == cell->capacity)
@@ -1724,6 +2017,7 @@ static int LG_RpqPath_MemoExtend
         next->next = block ;
         next->count = 0 ;
         work->result->blocks = block = next ;
+        if (profile != NULL) profile->path_blocks++ ;
     }
     size_t slot = hash & (cell->capacity - 1) ;
     LG_RpqPath_CachedNode *stored = &block->nodes[block->count++] ;
@@ -1734,6 +2028,8 @@ static int LG_RpqPath_MemoExtend
         .hash = hash, .hash_next = cell->index[slot] } ;
     cell->index[slot] = stored ;
     cell->paths[cell->count++] = &stored->node ;
+    if (profile != NULL)
+    { profile->prefixes++ ; if (cell->count > profile->prefix_max) profile->prefix_max = cell->count ; }
     return (GrB_SUCCESS) ;
 }
 
@@ -1744,6 +2040,8 @@ static int LG_RpqPath_Publish
     char *msg
 )
 {
+    LG_RpqPath_Profile *profile = work->profile ;
+    if (profile != NULL) profile->publish_attempts++ ;
     LG_RpqPath_CachedNode *node = LG_RpqPath_NodeStorage (path) ;
     if (work->output_capacity != 0)
     {
@@ -1751,7 +2049,7 @@ static int LG_RpqPath_Publish
             work->output_index[node->hash & (work->output_capacity - 1)] ;
             saved != NULL ; saved = saved->output_next)
             if (saved->hash == node->hash && LG_RpqPath_EqualNodes (&saved->node, path))
-                return (GrB_SUCCESS) ;
+                { if (profile != NULL) profile->publish_duplicates++ ; return (GrB_SUCCESS) ; }
     }
     if (work->count >= work->output_capacity)
     {
@@ -1778,6 +2076,13 @@ static int LG_RpqPath_Publish
     node->output_next = work->output_index[slot] ;
     work->output_index[slot] = node ;
     work->paths[work->count++] = (LG_RpqPath_Path) { .length = path->length, .tail = path } ;
+    if (profile != NULL)
+    {
+        if (profile->published++ == 0) profile->first_answer_ms = 1000 * (LAGraph_WallClockTime () - profile->start) ;
+        profile->published_length_sum += path->length ;
+        if (path->length > profile->published_length_max) profile->published_length_max = path->length ;
+        if (work->count >= LG_RPQ_PATH_MAX_COUNT) profile->count_limit = true ;
+    }
     return (GrB_SUCCESS) ;
 }
 
@@ -1895,6 +2200,7 @@ typedef struct
     LG_RpqPath_Visited visited ;
     const LG_RpqPath_Node *active ;
     bool edges ;
+    LG_RpqPath_Profile *profile ;
 }
 LG_RpqPath_JoinContext ;
 
@@ -1930,18 +2236,28 @@ static int LG_RpqPath_ActivatePrefix
             {
                 LG_RpqPath_NodeKey (old, context->edges, key) ;
                 LG_RpqPath_VisitErase (&context->visited, key) ;
+                if (context->profile != NULL) context->profile->visit_erases++ ;
             }
+            if (context->profile != NULL) context->profile->activate_steps++ ;
             old = old->prefix ;
         }
-        else common = common->prefix ;
+        else { if (context->profile != NULL) context->profile->activate_steps++ ; common = common->prefix ; }
     }
     for (const LG_RpqPath_Node *node = path ; node != common ; node = node->prefix)
     {
+        if (context->profile != NULL) context->profile->activate_steps++ ;
         if (context->edges && node->prefix == NULL) continue ;
         LG_RpqPath_NodeKey (node, context->edges, key) ;
         bool inserted ;
         int info = LG_RpqPath_VisitInsert (&context->visited, key, &inserted, msg) ;
         if (info != GrB_SUCCESS) return (info) ;
+        if (context->profile != NULL) context->profile->visit_inserts += inserted ;
+    }
+    if (context->profile != NULL)
+    {
+        context->profile->visited_count = context->visited.count ;
+        context->profile->visited_capacity = context->visited.capacity ;
+        context->profile->visited_bytes = context->visited.capacity * sizeof (LG_RpqPath_VisitedEntry) ;
     }
     context->active = path ;
     return (GrB_SUCCESS) ;
@@ -1986,7 +2302,14 @@ static void LG_RpqPath_RelaxDistance
 {
     if (!work->shortest || distance >= cell->distance) return ;
     cell->distance = distance ;
+    if (work->profile != NULL) work->profile->distance_relaxations++ ;
     if (cell->distance_queued) return ;
+    if (work->profile != NULL)
+    {
+        work->profile->distance_pending++ ;
+        if (work->profile->distance_pending > work->profile->distance_peak)
+            work->profile->distance_peak = work->profile->distance_pending ;
+    }
     cell->distance_queued = true ;
     cell->distance_next = NULL ;
     if (work->distance_tail != NULL) work->distance_tail->distance_next = cell ;
@@ -2002,6 +2325,7 @@ static int LG_RpqPath_PrepareCell
 )
 {
     if (target->loaded) return (GrB_SUCCESS) ;
+    if (work->profile != NULL) { work->profile->load_pending++ ; if (work->profile->load_peak == 0) work->profile->load_peak = 1 ; }
     target->scheduled = true ;
     target->load_next = work->load_head ;
     work->load_head = target ;
@@ -2019,9 +2343,11 @@ static int LG_RpqPath_PrepareCell
             cell->state, cell->vertex) ;
         if (info != GrB_SUCCESS && info != GrB_NO_VALUE) return (info) ;
         cell->loaded = true ;
+        if (work->profile != NULL) { work->profile->loaded_cells++ ; work->profile->load_pending-- ; }
         for (const LG_RpqPath_StoredAllocation *block = predecessors.allocation ;
              block != NULL ; block = block->previous)
         {
+            if (work->profile != NULL) { work->profile->read_blocks++ ; work->profile->read_records += block->count ; }
             for (size_t k = 0 ; k < block->count ; k++)
             {
                 const LG_RpqPath_Predecessor *record = &block->records[k] ;
@@ -2035,16 +2361,23 @@ static int LG_RpqPath_PrepareCell
                     .label = record->label, .dependent_next = source->dependents,
                     .allocation_next = work->edges } ;
                 work->edges = source->dependents = edge ;
+                if (work->profile != NULL) work->profile->dependencies++ ;
                 if (source->distance != SIZE_MAX)
                     LG_RpqPath_RelaxDistance (work, cell, source->distance + 1) ;
                 if (!source->loaded && !source->scheduled)
                 {
+                    if (work->profile != NULL)
+                    {
+                        work->profile->load_pending++ ;
+                        if (work->profile->load_pending > work->profile->load_peak) work->profile->load_peak = work->profile->load_pending ;
+                    }
                     source->scheduled = true ;
                     source->load_next = work->load_head ;
                     work->load_head = source ;
                 }
             }
         }
+        if (work->profile != NULL && (work->profile->loaded_cells & 4095) == 0) LG_RpqPath_ProfileReconstruction (work, false) ;
         if (root)
         {
             LG_RpqPath_RelaxDistance (work, cell, 0) ;
@@ -2060,6 +2393,7 @@ static int LG_RpqPath_PrepareCell
         work->distance_head = cell->distance_next ;
         if (work->distance_head == NULL) work->distance_tail = NULL ;
         cell->distance_queued = false ;
+        if (work->profile != NULL) work->profile->distance_pending-- ;
         for (LG_RpqPath_MemoEdge *edge = cell->dependents ; edge != NULL ;
              edge = edge->dependent_next)
             LG_RpqPath_RelaxDistance (work, edge->destination, cell->distance + 1) ;
@@ -2077,26 +2411,44 @@ static int LG_RpqPath_Propagate
     LG_RpqPath_JoinFn join, void *context, char *msg
 )
 {
-    if (edge->active) return (GrB_SUCCESS) ;
+    LG_RpqPath_Profile *profile = work->profile ;
+    if (profile != NULL) profile->propagate_calls++ ;
+    if (edge->active)
+    { if (profile != NULL) profile->active_returns++ ; return (GrB_SUCCESS) ; }
+    if (profile != NULL) { profile->depth++ ; if (profile->depth > profile->max_depth) profile->max_depth = profile->depth ; }
     edge->active = true ;
     int info = GrB_SUCCESS ;
     while (edge->cursor < edge->source->count && work->count < LG_RPQ_PATH_MAX_COUNT)
     {
         // Cache vectors may move during recursion; immutable prefix nodes do not.
         const LG_RpqPath_Node *prefix = edge->source->paths[edge->cursor++] ;
-        if (prefix->length >= LG_RPQ_PATH_MAX_LENGTH || (work->shortest &&
-            prefix->length + 1 != edge->destination->distance)) continue ;
+        if (profile != NULL)
+        {
+            profile->pairs++ ;
+            if ((profile->pairs & 4095) == 0) LG_RpqPath_ProfileReconstruction (work, false) ;
+        }
+        if (prefix->length >= LG_RPQ_PATH_MAX_LENGTH)
+        { if (profile != NULL) profile->reject_length++ ; continue ; }
+        if (work->shortest && prefix->length + 1 != edge->destination->distance)
+        { if (profile != NULL) profile->reject_shortest++ ; continue ; }
         bool accept = false ;
+        double timer = LG_RpqPath_ProfileClock (profile) ;
         info = join (prefix, edge, context, &accept, msg) ;
+        if (profile != NULL) profile->join_ms += 1000 * (LAGraph_WallClockTime () - timer) ;
         if (info != GrB_SUCCESS) break ;
-        if (!accept) continue ;
+        if (!accept) { if (profile != NULL) profile->reject_semantics++ ; continue ; }
+        if (profile != NULL) profile->accepted++ ;
         size_t count = edge->destination->count ;
+        timer = LG_RpqPath_ProfileClock (profile) ;
         info = LG_RpqPath_MemoExtend (work, edge->destination, prefix, edge->label, msg) ;
+        if (profile != NULL) profile->memo_ms += 1000 * (LAGraph_WallClockTime () - timer) ;
         if (info != GrB_SUCCESS) break ;
         if (count == edge->destination->count) continue ;
         if (edge->destination == work->target)
         {
+            timer = LG_RpqPath_ProfileClock (profile) ;
             info = LG_RpqPath_Publish (work, edge->destination->paths[count], msg) ;
+            if (profile != NULL) profile->publish_ms += 1000 * (LAGraph_WallClockTime () - timer) ;
             if (info != GrB_SUCCESS) break ;
         }
         for (LG_RpqPath_MemoEdge *next = edge->destination->dependents ; next != NULL &&
@@ -2107,6 +2459,7 @@ static int LG_RpqPath_Propagate
         }
         if (info != GrB_SUCCESS) break ;
     }
+    if (profile != NULL) profile->depth-- ;
     edge->active = false ;
     return (info) ;
 }
@@ -2178,7 +2531,10 @@ static int LG_RpqPath_GenerateTargets
             info = LG_RpqPath_MemoGet (work, QF[k], vertices[i], &target, msg) ;
             if (info != GrB_SUCCESS) goto generate_cleanup ;
             LG_RpqPath_MemoEdge *previous_edges = work->edges ;
+            double prepare_start = LG_RpqPath_ProfileClock (work->profile) ;
+            if (work->profile != NULL) work->profile->targets++ ;
             info = LG_RpqPath_PrepareCell (work, target, msg) ;
+            if (work->profile != NULL) work->profile->prepare_ms += 1000 * (LAGraph_WallClockTime () - prepare_start) ;
             if (info != GrB_SUCCESS) goto generate_cleanup ;
             work->target = target ;
             for (size_t emitted = 0 ; emitted < target->count &&
@@ -2217,7 +2573,7 @@ static int LG_RpqPath_ReconstructSimple
     LG_RpqPath_Reconstruction *work, const GrB_Index *QF, size_t nqf, GrB_Index ng, char *msg
 )
 {
-    LG_RpqPath_JoinContext context = { 0 } ;
+    LG_RpqPath_JoinContext context = { .profile = work->profile } ;
     int info = LG_RpqPath_GenerateTargets (work, QF, nqf, ng,
         LG_RpqPath_JoinRestricted, &context, msg) ;
     LAGraph_Free ((void **) &context.visited.entries, NULL) ;
@@ -2229,7 +2585,7 @@ static int LG_RpqPath_ReconstructTrails
     LG_RpqPath_Reconstruction *work, const GrB_Index *QF, size_t nqf, GrB_Index ng, char *msg
 )
 {
-    LG_RpqPath_JoinContext context = { .edges = true } ;
+    LG_RpqPath_JoinContext context = { .edges = true, .profile = work->profile } ;
     int info = LG_RpqPath_GenerateTargets (work, QF, nqf, ng,
         LG_RpqPath_JoinRestricted, &context, msg) ;
     LAGraph_Free ((void **) &context.visited.entries, NULL) ;
@@ -2293,13 +2649,15 @@ static int LG_RpqPath_Process
     size_t nqf,
     GrB_Index ng,
     LG_RpqPath_ReconstructFn reconstruct,
+    LG_RpqPath_Profile *profile,
     char *msg
 )
 {
     *paths = NULL ;
     *path_count = 0 ;
-    LG_RpqPath_Reconstruction reconstruction = { .P = P, .roots = roots } ;
+    LG_RpqPath_Reconstruction reconstruction = { .P = P, .roots = roots, .profile = profile } ;
     int info = reconstruct (&reconstruction, QF, nqf, ng, msg) ;
+    LG_RpqPath_ProfileReconstruction (&reconstruction, true) ;
     if (info == GrB_SUCCESS)
     {
         *paths = reconstruction.paths ;
@@ -2377,6 +2735,24 @@ static int LG_RpqPath_Query
     LG_CLEAR_MSG ;
     *paths = NULL ;
     *path_count = 0 ;
+    LG_RpqPath_Profile profile_storage ;
+    LG_RpqPath_Profile *profile = LG_RpqPath_ProfileOpen (&profile_storage) ;
+    double stage_start = LG_RpqPath_ProfileClock (profile) ;
+    LG_RpqPath_ProfileText (profile, "baseline", "fa40ffd3") ;
+    LG_RpqPath_ProfileText (profile, "semantics", reconstruct == LG_RpqPath_ReconstructSimple ? "simple" :
+        reconstruct == LG_RpqPath_ReconstructTrails ? "trails" : reconstruct == LG_RpqPath_ReconstructShortest ? "shortest" : "all") ;
+    LG_RpqPath_ProfileU (profile, "labels", nl) ;
+    LG_RpqPath_ProfileU (profile, "nqs", nqs) ; LG_RpqPath_ProfileU (profile, "nqf", nqf) ;
+    LG_RpqPath_ProfileU (profile, "ns", ns) ;
+    LG_RpqPath_ProfileU (profile, "max_length", LG_RPQ_PATH_MAX_LENGTH) ;
+    LG_RpqPath_ProfileU (profile, "max_count", LG_RPQ_PATH_MAX_COUNT) ;
+    int32_t threads = 0, jit = 0 ;
+    if (profile != NULL)
+    {
+        GxB_Global_Option_get_INT32 (GxB_NTHREADS, &threads) ;
+        GxB_Global_Option_get_INT32 (GxB_JIT_C_CONTROL, &jit) ;
+        LG_RpqPath_ProfileU (profile, "threads", threads) ; LG_RpqPath_ProfileU (profile, "jit", jit) ;
+    }
     LG_RpqPath_Workspace *work = NULL ;
     GrB_Matrix P = NULL, roots = NULL ;
     LG_RpqPath_StoredOwner P_owner =
@@ -2386,29 +2762,70 @@ static int LG_RpqPath_Query
     } ;
     int info = LG_RpqPath_Init (&work, R, nl, G, msg) ;
     if (info != GrB_SUCCESS) goto query_cleanup ;
-    info = GrB_Matrix_new (&roots, GrB_BOOL, work->nr, work->ng) ;
-    if (info != GrB_SUCCESS) goto query_cleanup ;
+    LG_RpqPath_ProfileU (profile, "vertices", work->ng) ;
+    LG_RpqPath_ProfileU (profile, "states", work->nr) ;
+    for (size_t a = 0 ; profile != NULL && a < nl ; a++)
+    {
+        profile->label = (int64_t) a ;
+        LG_RpqPath_ProfileMatrix (profile, "N", work->N[a], 0) ;
+        LG_RpqPath_ProfileMatrix (profile, "A", work->A[a], 0) ;
+    }
+    if (profile != NULL) profile->label = -1 ;
+    LG_RPQ_CALL ("new_roots", roots,
+        GrB_Matrix_new (&roots, GrB_BOOL, work->nr, work->ng), query_cleanup) ;
     if (nqs > 0 && ns > 0)
     {
-        info = GrB_Matrix_assign_BOOL (roots, NULL, NULL, true,
-            QS, nqs, S, ns, NULL) ;
-        if (info != GrB_SUCCESS) goto query_cleanup ;
+        LG_RPQ_CALL ("assign_roots", roots, GrB_Matrix_assign_BOOL (roots, NULL, NULL, true,
+            QS, nqs, S, ns, NULL), query_cleanup) ;
+        LG_RpqPath_ProfileMatrix (profile, "roots", roots, 0) ;
     }
 
+    if (profile != NULL)
+    {
+        LG_RpqPath_ProfileEvent (profile, "setup_end") ;
+        LG_RpqPath_ProfileD (profile, "total_ms", 1000 * (LAGraph_WallClockTime () - stage_start)) ;
+        profile->phase = "traverse" ; stage_start = LAGraph_WallClockTime () ;
+    }
     // Stage 1: finish the matrix algorithm, regardless of path semantics.
-    info = LG_RpqPath_Traverse (&P, &P_owner, work, roots, msg) ;
+    info = LG_RpqPath_Traverse (&P, &P_owner, work, roots, profile, msg) ;
     if (info != GrB_SUCCESS) goto query_cleanup ;
 
+    if (profile != NULL)
+    {
+        LG_RpqPath_ProfileEvent (profile, "end") ;
+        LG_RpqPath_ProfileD (profile, "total_ms", 1000 * (LAGraph_WallClockTime () - stage_start)) ;
+        LG_RpqPath_ProfileU (profile, "iterations", profile->iteration) ;
+        LG_RpqPath_ProfileFlush (profile) ;
+        profile->phase = "reconstruct" ; profile->iteration = 0 ; stage_start = LAGraph_WallClockTime () ;
+    }
     // Stage 2: the shared reconstruction only reads P and roots.  Their
     // storage remains live until reconstruction and result filtering finish.
     info = LG_RpqPath_Process (paths, path_count, P, roots, QF, nqf,
-        work->ng, reconstruct, msg) ;
+        work->ng, reconstruct, profile, msg) ;
 
 query_cleanup:
+    if (profile != NULL)
+    {
+        LG_RpqPath_ProfileEvent (profile, "end") ;
+        LG_RpqPath_ProfileD (profile, "total_ms", 1000 * (LAGraph_WallClockTime () - stage_start)) ;
+        profile->phase = "query" ; profile->iteration = 0 ;
+    }
+    stage_start = LG_RpqPath_ProfileClock (profile) ;
     GrB_free (&P) ;
     LG_RpqPath_StoredRelease (&P_owner) ;
     GrB_free (&roots) ;
     LG_RpqPath_Free (&work) ;
+    if (profile != NULL)
+    {
+        LG_RpqPath_ProfileEvent (profile, "end") ;
+        LG_RpqPath_ProfileD (profile, "cleanup_ms", 1000 * (LAGraph_WallClockTime () - stage_start)) ;
+        LG_RpqPath_ProfileD (profile, "total_ms", 1000 * (LAGraph_WallClockTime () - profile->start)) ;
+        LG_RpqPath_ProfileD (profile, "snapshot_ms", profile->stats_ms) ;
+        LG_RpqPath_ProfileD (profile, "io_ms", profile->io_ms) ;
+        LG_RpqPath_ProfileD (profile, "status", info) ;
+        LG_RpqPath_ProfileU (profile, "paths", *path_count) ;
+        LG_RpqPath_ProfileClose (profile) ;
+    }
     if (info != GrB_SUCCESS && (msg == NULL || msg[0] == '\0'))
     {
         LG_ERROR_MSG ("RPQ query failed: info: %d", info) ;
