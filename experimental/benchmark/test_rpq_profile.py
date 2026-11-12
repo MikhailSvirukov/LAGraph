@@ -19,6 +19,16 @@ class AggregationTest(unittest.TestCase):
                                     check=True, text=True, capture_output=True)
             return list(csv.DictReader(io.StringIO(result.stdout), delimiter='\t')), result.stderr
 
+    def test_empty_crash_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'empty.tsv'
+            path.touch()
+            result = subprocess.run([sys.executable, str(SCRIPT), str(path)],
+                                    check=True, text=True, capture_output=True)
+            rows = list(csv.DictReader(io.StringIO(result.stdout), delimiter='\t'))
+            self.assertEqual(rows[0]['complete'], '0')
+            self.assertIn('empty profile', result.stderr)
+
     def test_time_sums_and_cumulative_count(self):
         rows, _ = self.aggregate(
             'traverse\t1\t0\tmxm1\t1\ttotal_ms\t1.25\n'

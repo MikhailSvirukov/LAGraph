@@ -12,6 +12,9 @@ from pathlib import Path
 def read(path):
     with open(path, newline='') as stream:
         reader = csv.DictReader(stream, delimiter='\t')
+        if reader.fieldnames is None:
+            print(f'{path}: empty profile (interrupted before header flush)', file=sys.stderr)
+            return
         required = {'phase', 'iteration', 'label', 'event', 'elapsed_ms', 'metric', 'value'}
         if set(reader.fieldnames or []) != required:
             raise ValueError(f'{path}: unexpected profile header')
@@ -68,6 +71,8 @@ def main():
                 values[key + '.max'] = max(values.get(key + '.max', number), number)
                 values[key + '.last'] = number
             values['elapsed_ms'] = row['elapsed_ms']
+        if not groups and args.by == 'query':
+            groups[()] = {}
         for group, values in groups.items():
             result = dict(metadata, complete=int(complete), **values)
             if group:
