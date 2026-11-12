@@ -1070,7 +1070,7 @@ static int LG_RpqPath_CreateStateOperators
     info = GrB_Descriptor_set (ops->state_product, GrB_INP0, GrB_TRAN) ;
     if (info != GrB_SUCCESS) goto state_cleanup ;
     info = GrB_Descriptor_set (ops->state_product,
-        GxB_AxB_METHOD, GxB_AxB_SAXPY) ;
+        GxB_AxB_METHOD, GxB_DEFAULT) ;
     if (info != GrB_SUCCESS) goto state_cleanup ;
 
 state_cleanup:
@@ -1086,7 +1086,7 @@ state_cleanup:
  * @param[in] pool Non-NULL initialized arena, borrowed through all uses of its
  *     empty-set identity and label-bound multipliers.
  * @return GrB_SUCCESS or a GraphBLAS error.  The multiplier is bound per label
- *     separately; this function creates its indexed operator and SAXPY descriptor.
+ *     separately; this function creates its indexed operator and AUTO descriptor.
  */
 static int LG_RpqPath_CreatePredecessorOperators
 (
@@ -1116,7 +1116,7 @@ static int LG_RpqPath_CreatePredecessorOperators
     info = GrB_Descriptor_new (&ops->predecessor_product) ;
     if (info != GrB_SUCCESS) return (info) ;
     info = GrB_Descriptor_set (ops->predecessor_product,
-        GxB_AxB_METHOD, GxB_AxB_SAXPY) ;
+        GxB_AxB_METHOD, GxB_DEFAULT) ;
     if (info != GrB_SUCCESS) return (info) ;
 
     return (GrB_SUCCESS) ;
@@ -1343,7 +1343,7 @@ int LG_RpqPath_Traverse
             info = GrB_Matrix_nvals (&h_nvals, H) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
             if (h_nvals == 0) continue ;
-            // The caller supplies graph directions.  Use SAXPY multiplication;
+            // The caller supplies graph directions.  Use AUTO multiplication;
             // H's column j identifies the predecessor vertex.
             info = GrB_mxm (C, NULL, ops.predecessor_union, label_ops[a].semiring,
                 H, work->A[a], ops.predecessor_product) ;
