@@ -136,3 +136,10 @@ target_compile_definitions ( test_2RpqPath_limits PRIVATE
     LGX_LIBRARY LG_RPQ_PATH_MAX_LENGTH=8 LG_RPQ_PATH_MAX_COUNT=4 )
 set_tests_properties ( LAGraphX_2RpqPath_limits PROPERTIES TIMEOUT 60 )
 
+
+# Force one-word path filters: collisions must fall back to exact comparisons.
+target_sources ( test_2RpqPath_bloom PRIVATE
+    ${PROJECT_SOURCE_DIR}/experimental/algorithm/LAGraph_2RpqPath.c )
+target_compile_definitions ( test_2RpqPath_bloom PRIVATE
+    LGX_LIBRARY LG_RPQ_PATH_BLOOM_MAX_BYTES=8 )
+set_tests_properties ( LAGraphX_2RpqPath_bloom PROPERTIES TIMEOUT 60 )

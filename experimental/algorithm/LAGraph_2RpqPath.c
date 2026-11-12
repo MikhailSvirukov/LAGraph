@@ -23,6 +23,7 @@
 #include "LG_internal.h"
 #include "LAGraphX.h"
 #include <stdatomic.h>
+#include "LG_RpqPath_bloom.h"
 
 // Input correctness is the caller's responsibility.
 
@@ -511,14 +512,22 @@ typedef struct LG_RpqPath_StoredAllocation
 }
 LG_RpqPath_StoredAllocation ;
 
+typedef struct LG_RpqPath_CellBloom
+{
+    LG_RpqPath_BloomShape shape ;
+    struct LG_RpqPath_CellBloom *next, *previous ; // owner links, protected by lock
+    bool retired ;
+    uint64_t bits[] ;
+} LG_RpqPath_CellBloom ;
+
 // P values refer to ordinary heap allocations, never to the temporary arena.
 // count is the total across the chain.  Each block is sorted, not the chain.
-// The 128-bit Bloom filter covers the whole set; positives need exact lookup.
+// A query-owned, growable Bloom filter covers this cell; positives need exact lookup.
 typedef struct
 {
     size_t count ;
     LG_RpqPath_StoredAllocation *allocation ; // NULL denotes the empty set
-    uint64_t bloom [2] ;
+    LG_RpqPath_CellBloom *bloom ;
 }
 LG_RpqPath_StoredSet ;
 
@@ -529,6 +538,8 @@ typedef struct
 {
     _Atomic (LG_RpqPath_StoredAllocation *) allocations ;
     atomic_int error ;
+    atomic_flag bloom_lock ;
+    LG_RpqPath_CellBloom *filters, *retired ;
 }
 LG_RpqPath_StoredOwner ;
 
@@ -538,6 +549,71 @@ typedef struct
     LG_RpqPath_StoredOwner *owner ;
 }
 LG_RpqPath_StoredContext ;
+
+static void LG_RpqPath_CellBloomLock (LG_RpqPath_StoredOwner *owner)
+{
+    while (atomic_flag_test_and_set_explicit (&owner->bloom_lock, memory_order_acquire)) { }
+}
+static void LG_RpqPath_CellBloomUnlock (LG_RpqPath_StoredOwner *owner)
+{
+    atomic_flag_clear_explicit (&owner->bloom_lock, memory_order_release) ;
+}
+static int LG_RpqPath_CellBloomNew (LG_RpqPath_StoredOwner *owner,
+    const LG_RpqPath_BloomShape *shape, LG_RpqPath_CellBloom **result, char *msg)
+{
+    if (shape->words > (SIZE_MAX - sizeof (LG_RpqPath_CellBloom)) / sizeof (uint64_t))
+        return GrB_OUT_OF_MEMORY ;
+    size_t bytes = sizeof (LG_RpqPath_CellBloom) + shape->words * sizeof (uint64_t) ;
+    LG_RpqPath_CellBloom *filter = NULL ;
+    int info = LAGraph_Calloc ((void **) &filter, bytes, 1, msg) ;
+    if (info != GrB_SUCCESS) return info ;
+    filter->shape = *shape ;
+    LG_RpqPath_CellBloomLock (owner) ;
+    filter->next = owner->filters ;
+    if (owner->filters != NULL) owner->filters->previous = filter ;
+    owner->filters = filter ;
+    LG_RpqPath_CellBloomUnlock (owner) ;
+    *result = filter ; return GrB_SUCCESS ;
+}
+static void LG_RpqPath_CellBloomRetire (LG_RpqPath_StoredOwner *owner,
+    LG_RpqPath_CellBloom *filter)
+{
+    if (filter == NULL) return ;
+    LG_RpqPath_CellBloomLock (owner) ;
+    if (!filter->retired)
+    {
+        if (filter->previous != NULL) filter->previous->next = filter->next ;
+        else owner->filters = filter->next ;
+        if (filter->next != NULL) filter->next->previous = filter->previous ;
+        filter->retired = true ; filter->previous = NULL ;
+        filter->next = owner->retired ; owner->retired = filter ;
+    }
+    LG_RpqPath_CellBloomUnlock (owner) ;
+}
+// Only after all callbacks/readers finish; never free a retired input in a callback.
+static void LG_RpqPath_CellBloomCleanup (LG_RpqPath_StoredOwner *owner)
+{
+    while (owner->retired != NULL)
+    {
+        LG_RpqPath_CellBloom *next = owner->retired->next ;
+        LAGraph_Free ((void **) &owner->retired, NULL) ; owner->retired = next ;
+    }
+}
+static uint64_t LG_RpqPath_RecordHash (const LG_RpqPath_Predecessor *record)
+{
+    return LG_RpqPath_BloomKey (record->state, record->vertex, record->label) ;
+}
+static void LG_RpqPath_CellBloomAdd (LG_RpqPath_CellBloom *filter,
+    const LG_RpqPath_Predecessor *record)
+{
+    uint64_t hash = LG_RpqPath_RecordHash (record), stride = LG_RpqPath_BloomStride (hash) ;
+    for (size_t k = 0 ; k < filter->shape.hashes ; k++)
+    {
+        size_t bit = LG_RpqPath_BloomPosition (&filter->shape, hash, stride, k) ;
+        filter->bits[bit / 64] |= UINT64_C (1) << (bit % 64) ;
+    }
+}
+
 
 /**
  * @brief Allocate one immutable delta block and register its query owner.
@@ -596,6 +672,12 @@ static int LG_RpqPath_StoredAllocate
  */
 static void LG_RpqPath_StoredRelease (LG_RpqPath_StoredOwner *owner)
 {
+    LG_RpqPath_CellBloomCleanup (owner) ;
+    while (owner->filters != NULL)
+    {
+        LG_RpqPath_CellBloom *next = owner->filters->next ;
+        LAGraph_Free ((void **) &owner->filters, NULL) ; owner->filters = next ;
+    }
     LG_RpqPath_StoredAllocation *allocation =
         atomic_exchange (&owner->allocations, NULL) ;
     while (allocation != NULL)
@@ -605,31 +687,6 @@ static void LG_RpqPath_StoredRelease (LG_RpqPath_StoredOwner *owner)
         allocation = next ;
     }
     atomic_store (&owner->error, GrB_SUCCESS) ;
-}
-
-// SplitMix64 finalizer: unsigned arithmetic is intentional.  The filter is
-// only a negative test; hash collisions never replace exact triple comparison.
-static uint64_t LG_RpqPath_Hash (uint64_t x)
-{
-    x = (x ^ (x >> 30)) * UINT64_C (0xbf58476d1ce4e5b9) ;
-    x = (x ^ (x >> 27)) * UINT64_C (0x94d049bb133111eb) ;
-    return (x ^ (x >> 31)) ;
-}
-
-static void LG_RpqPath_BloomBits
-(
-    const LG_RpqPath_Predecessor *record,
-    uint64_t bits [2]
-)
-{
-    uint64_t h = LG_RpqPath_Hash (record->state +
-        UINT64_C (0x9e3779b97f4a7c15)) ;
-    h = LG_RpqPath_Hash (h ^ record->vertex) ;
-    h = LG_RpqPath_Hash (h ^ (uint64_t) record->label) ;
-    bits[0] = (UINT64_C (1) << (h & 63)) |
-              (UINT64_C (1) << ((h >> 6) & 63)) ;
-    bits[1] = (UINT64_C (1) << ((h >> 12) & 63)) |
-              (UINT64_C (1) << ((h >> 18) & 63)) ;
 }
 
 /**
@@ -644,10 +701,14 @@ static bool LG_RpqPath_StoredContains
     const LG_RpqPath_Predecessor *record
 )
 {
-    uint64_t bits [2] ;
-    LG_RpqPath_BloomBits (record, bits) ;
-    if ((stored->bloom[0] & bits[0]) != bits[0] ||
-        (stored->bloom[1] & bits[1]) != bits[1]) return (false) ;
+    const LG_RpqPath_CellBloom *filter = stored->bloom ;
+    if (filter == NULL) return false ;
+    uint64_t hash = LG_RpqPath_RecordHash (record), stride = LG_RpqPath_BloomStride (hash) ;
+    for (size_t k = 0 ; k < filter->shape.hashes ; k++)
+    {
+        size_t bit = LG_RpqPath_BloomPosition (&filter->shape, hash, stride, k) ;
+        if (!(filter->bits[bit / 64] & (UINT64_C (1) << (bit % 64)))) return false ;
+    }
 
     for (const LG_RpqPath_StoredAllocation *block = stored->allocation ;
          block != NULL ; block = block->previous)
@@ -733,6 +794,25 @@ static int LG_RpqPath_MergeStoredSet
     int info = LG_RpqPath_StoredAllocate (owner, added, &delta, msg) ;
     if (info != GrB_SUCCESS) return (info) ;
     delta->previous = stored->allocation ;
+    size_t needed = stored->count + added ;
+    LG_RpqPath_BloomShape shape ;
+    bool rebuild = stored->bloom == NULL || stored->bloom->shape.capacity < needed ;
+    if (rebuild)
+    {
+        size_t capacity = stored->bloom == NULL ? 8 : stored->bloom->shape.capacity ;
+        while (capacity < needed)
+            capacity = capacity > SIZE_MAX / 2 ? needed : 2 * capacity ;
+        info = LG_RpqPath_BloomShapeNew (capacity, SIZE_MAX, &shape) ;
+        if (info != GrB_SUCCESS) return info ;
+    }
+    else shape = stored->bloom->shape ;
+    LG_RpqPath_CellBloom *filter = NULL ;
+    info = LG_RpqPath_CellBloomNew (owner, &shape, &filter, msg) ;
+    if (info != GrB_SUCCESS) return info ;
+    if (!rebuild) memcpy (filter->bits, stored->bloom->bits, shape.words * sizeof (uint64_t)) ;
+    else
+        for (const LG_RpqPath_StoredAllocation *b = stored->allocation ; b != NULL ; b = b->previous)
+            for (size_t k = 0 ; k < b->count ; k++) LG_RpqPath_CellBloomAdd (filter, &b->records[k]) ;
     size_t used = 0 ;
     for (const LG_RpqPath_PredecessorBlock *block = temporary->head ;
          block != NULL ; block = block->next)
@@ -742,14 +822,13 @@ static int LG_RpqPath_MergeStoredSet
             const LG_RpqPath_Predecessor *record = &block->records[k] ;
             if (LG_RpqPath_StoredContains (stored, record)) continue ;
             delta->records[used++] = *record ;
-            uint64_t bits [2] ;
-            LG_RpqPath_BloomBits (record, bits) ;
-            result->bloom[0] |= bits[0] ;
-            result->bloom[1] |= bits[1] ;
+            LG_RpqPath_CellBloomAdd (filter, record) ;
         }
     }
     result->count += added ;
     result->allocation = delta ;
+    result->bloom = filter ;
+    LG_RpqPath_CellBloomRetire (owner, stored->bloom) ;
     return (GrB_SUCCESS) ;
 }
 
@@ -1264,7 +1343,8 @@ int LG_RpqPath_Traverse
     LG_RpqPath_StoredOwner stored_owner =
     {
         .allocations = ATOMIC_VAR_INIT (NULL),
-        .error = ATOMIC_VAR_INIT (GrB_SUCCESS)
+        .error = ATOMIC_VAR_INIT (GrB_SUCCESS),
+        .bloom_lock = ATOMIC_FLAG_INIT
     } ;
 
     GrB_Scalar stored_context = NULL ;
@@ -1415,12 +1495,14 @@ iteration_cleanup:
         GrB_free (&C) ;
         GrB_free (&next_frontier) ;
         LG_RpqPath_PoolReset (&pool) ;
+        LG_RpqPath_CellBloomCleanup (&stored_owner) ;
         if (info != GrB_SUCCESS) goto traversal_cleanup ;
     }
 
     // Return P and all persistent delta blocks for reconstruction.
     *P_handle = P ;
     P = NULL ;
+    P_owner->filters = stored_owner.filters ; stored_owner.filters = NULL ;
     atomic_store (&P_owner->allocations,
         atomic_exchange (&stored_owner.allocations, NULL)) ;
 traversal_cleanup:
@@ -1471,6 +1553,7 @@ typedef struct LG_RpqPath_CachedNode
     LG_RpqPath_Node node ;
     uint64_t hash ;
     struct LG_RpqPath_CachedNode *hash_next, *output_next ;
+    const LG_RpqPath_BloomNode *bloom ;
 }
 LG_RpqPath_CachedNode ;
 
@@ -1526,6 +1609,9 @@ typedef struct
     LG_RpqPath_CachedNode **output_index ;
     size_t output_capacity ;
     bool shortest ;
+    bool bloom_enabled, bloom_edges ;
+    LG_RpqPath_BloomShape bloom_shape ;
+    LG_RpqPath_BloomNodes *bloom_nodes ;
 }
 LG_RpqPath_Reconstruction ;
 
@@ -1726,12 +1812,20 @@ static int LG_RpqPath_MemoExtend
         work->result->blocks = block = next ;
     }
     size_t slot = hash & (cell->capacity - 1) ;
+    const LG_RpqPath_BloomNode *bloom = prefix == NULL ? NULL : LG_RpqPath_NodeStorage (prefix)->bloom ;
+    if (work->bloom_enabled && (!work->bloom_edges || prefix != NULL))
+    {
+        uint64_t key = work->bloom_edges ? LG_RpqPath_BloomKey (prefix->vertex, label, cell->vertex) :
+            LG_RpqPath_BloomKey (cell->vertex, 0, 0) ;
+        info = LG_RpqPath_BloomExtend (&work->bloom_shape, &work->bloom_nodes, bloom, key, &bloom, msg) ;
+        if (info != GrB_SUCCESS) return info ;
+    }
     LG_RpqPath_CachedNode *stored = &block->nodes[block->count++] ;
     *stored = (LG_RpqPath_CachedNode) { .node =
         { .prefix = prefix, .vertex = cell->vertex,
           .label = prefix == NULL ? 0 : label,
           .length = prefix == NULL ? 0 : prefix->length + 1 },
-        .hash = hash, .hash_next = cell->index[slot] } ;
+        .hash = hash, .hash_next = cell->index[slot], .bloom = bloom } ;
     cell->index[slot] = stored ;
     cell->paths[cell->count++] = &stored->node ;
     return (GrB_SUCCESS) ;
@@ -1781,172 +1875,10 @@ static int LG_RpqPath_Publish
     return (GrB_SUCCESS) ;
 }
 
-// Path-local membership table, shared by simple vertices and trail edges.
-// Keys are (vertex,0,0) or (from,label,to), never NFA configurations.  Linear
-// probing with backward-shift deletion retains no tombstones between branches.
-typedef struct
-{
-    uint64_t key [3] ;
-    bool used ;
-}
-LG_RpqPath_VisitedEntry ;
-
-typedef struct
-{
-    LG_RpqPath_VisitedEntry *entries ;
-    size_t count, capacity ;
-}
-LG_RpqPath_Visited ;
-
-static size_t LG_RpqPath_VisitHash (const uint64_t key [3])
-{
-    uint64_t h = LG_RpqPath_Hash (key[0] + UINT64_C (0x9e3779b97f4a7c15)) ;
-    h = LG_RpqPath_Hash (h ^ key[1]) ;
-    return ((size_t) LG_RpqPath_Hash (h ^ key[2])) ;
-}
-
-static size_t LG_RpqPath_VisitSlot
-(
-    const LG_RpqPath_Visited *set,
-    const uint64_t key [3]
-)
-{
-    size_t slot = LG_RpqPath_VisitHash (key) & (set->capacity - 1) ;
-    while (set->entries[slot].used &&
-        memcmp (set->entries[slot].key, key, 3 * sizeof (uint64_t)) != 0)
-        slot = (slot + 1) & (set->capacity - 1) ;
-    return (slot) ;
-}
-
-/** Insert a path-local key, reporting an existing key without changing it.
- * Growth keeps the load at most one half; allocation failure preserves set.
- */
-static int LG_RpqPath_VisitInsert
-(
-    LG_RpqPath_Visited *set,
-    const uint64_t key [3],
-    bool *inserted,
-    char *msg
-)
-{
-    *inserted = false ;
-    if (set->capacity != 0 &&
-        set->entries[LG_RpqPath_VisitSlot (set, key)].used)
-        return (GrB_SUCCESS) ;
-    if (set->count >= set->capacity / 2)
-    {
-        if (set->capacity > SIZE_MAX / 2 / sizeof (LG_RpqPath_VisitedEntry))
-        {
-            LG_ERROR_MSG ("path membership table exceeds addressable memory") ;
-            return (GrB_OUT_OF_MEMORY) ;
-        }
-        LG_RpqPath_Visited grown = { .capacity =
-            set->capacity == 0 ? 16 : 2 * set->capacity } ;
-        int info = LAGraph_Calloc ((void **) &grown.entries, grown.capacity,
-            sizeof (LG_RpqPath_VisitedEntry), msg) ;
-        if (info != GrB_SUCCESS) return (info) ;
-        for (size_t k = 0 ; k < set->capacity ; k++)
-        {
-            if (!set->entries[k].used) continue ;
-            size_t slot = LG_RpqPath_VisitSlot (&grown, set->entries[k].key) ;
-            grown.entries[slot] = set->entries[k] ;
-        }
-        grown.count = set->count ;
-        LAGraph_Free ((void **) &set->entries, NULL) ;
-        *set = grown ;
-    }
-    size_t slot = LG_RpqPath_VisitSlot (set, key) ;
-    memcpy (set->entries[slot].key, key, 3 * sizeof (uint64_t)) ;
-    set->entries[slot].used = true ;
-    set->count++ ;
-    *inserted = true ;
-    return (GrB_SUCCESS) ;
-}
-
-// Remove a key when moving away from the active prefix.  Look up its slot
-// again because previous prefix activations may have resized the table.
-static void LG_RpqPath_VisitErase
-(
-    LG_RpqPath_Visited *set,
-    const uint64_t key [3]
-)
-{
-    size_t mask = set->capacity - 1 ;
-    size_t hole = LG_RpqPath_VisitSlot (set, key) ;
-    for (size_t slot = (hole + 1) & mask ; set->entries[slot].used ;
-         slot = (slot + 1) & mask)
-    {
-        size_t home = LG_RpqPath_VisitHash (set->entries[slot].key) & mask ;
-        if (((hole - home) & mask) < ((slot - home) & mask))
-        {
-            set->entries[hole] = set->entries[slot] ;
-            hole = slot ;
-        }
-    }
-    set->entries[hole].used = false ;
-    set->count-- ;
-}
-
-// The active membership table follows immutable prefixes.  Moving between
-// related prefixes removes/adds only their nonshared tails; a chain extension
-// therefore does not rescan all its ancestors or copy a per-path hash table.
-typedef struct
-{
-    LG_RpqPath_Visited visited ;
-    const LG_RpqPath_Node *active ;
-    bool edges ;
-}
-LG_RpqPath_JoinContext ;
-
 typedef int (*LG_RpqPath_JoinFn)
 (
     const LG_RpqPath_Node *, const LG_RpqPath_MemoEdge *, void *, bool *, char *
 ) ;
-
-static void LG_RpqPath_NodeKey
-(
-    const LG_RpqPath_Node *node, bool edges, uint64_t key [3]
-)
-{
-    key[0] = edges ? node->prefix->vertex : node->vertex ;
-    key[1] = edges ? node->label : 0 ;
-    key[2] = edges ? node->vertex : 0 ;
-}
-
-static int LG_RpqPath_ActivatePrefix
-(
-    LG_RpqPath_JoinContext *context,
-    const LG_RpqPath_Node *path,
-    char *msg
-)
-{
-    const LG_RpqPath_Node *old = context->active, *common = path ;
-    uint64_t key [3] ;
-    while (old != common)
-    {
-        if (common == NULL || (old != NULL && old->length >= common->length))
-        {
-            if (!context->edges || old->prefix != NULL)
-            {
-                LG_RpqPath_NodeKey (old, context->edges, key) ;
-                LG_RpqPath_VisitErase (&context->visited, key) ;
-            }
-            old = old->prefix ;
-        }
-        else common = common->prefix ;
-    }
-    for (const LG_RpqPath_Node *node = path ; node != common ; node = node->prefix)
-    {
-        if (context->edges && node->prefix == NULL) continue ;
-        LG_RpqPath_NodeKey (node, context->edges, key) ;
-        bool inserted ;
-        int info = LG_RpqPath_VisitInsert (&context->visited, key, &inserted, msg) ;
-        if (info != GrB_SUCCESS) return (info) ;
-    }
-    context->active = path ;
-    return (GrB_SUCCESS) ;
-}
-
 static int LG_RpqPath_JoinAll
 (
     const LG_RpqPath_Node *prefix, const LG_RpqPath_MemoEdge *edge,
@@ -1954,29 +1886,66 @@ static int LG_RpqPath_JoinAll
 )
 {
     (void) prefix ; (void) edge ; (void) context ; (void) msg ;
-    *accept = true ;
-    return (GrB_SUCCESS) ;
+    *accept = true ; return GrB_SUCCESS ;
 }
-
+// One fixed shape for every version. P/roots counts are conservative bounds,
+// not estimates of the total number of cached prefixes.
+static int LG_RpqPath_PathBloomInit (LG_RpqPath_Reconstruction *work, bool edges)
+{
+    GrB_Index p_count = 0, roots_count = 0 ;
+    int info = GrB_Matrix_nvals (&p_count, work->P) ;
+    if (info != GrB_SUCCESS) return info ;
+    info = GrB_Matrix_nvals (&roots_count, work->roots) ;
+    if (info != GrB_SUCCESS) return info ;
+    size_t bound = (size_t) LG_RPQ_PATH_MAX_LENGTH ;
+    if (!edges)
+    {
+        if (bound != SIZE_MAX) bound++ ;
+        size_t cells = p_count > SIZE_MAX - roots_count ? SIZE_MAX : (size_t) p_count + roots_count ;
+        if (cells < bound) bound = cells ;
+    }
+    else
+    {
+        GxB_Iterator it = NULL ; size_t total = 0 ;
+        info = GxB_Iterator_new (&it) ;
+        if (info != GrB_SUCCESS) return info ;
+        info = GxB_Matrix_Iterator_attach (it, work->P, NULL) ;
+        if (info == GrB_SUCCESS)
+            for (info = GxB_Matrix_Iterator_seek (it, 0) ; info == GrB_SUCCESS ; info = GxB_Matrix_Iterator_next (it))
+            {
+                LG_RpqPath_StoredSet set ; GxB_Iterator_get_UDT (it, &set) ;
+                total = set.count > SIZE_MAX - total ? SIZE_MAX : total + set.count ;
+            }
+        GrB_free (&it) ;
+        if (info != GxB_EXHAUSTED && info != GrB_SUCCESS) return info ;
+        if (total < bound) bound = total ;
+    }
+    info = LG_RpqPath_BloomShapeNew (bound, LG_RPQ_PATH_BLOOM_MAX_BYTES, &work->bloom_shape) ;
+    if (info == GrB_SUCCESS) { work->bloom_enabled = true ; work->bloom_edges = edges ; }
+    return info ;
+}
 static int LG_RpqPath_JoinRestricted
 (
     const LG_RpqPath_Node *prefix, const LG_RpqPath_MemoEdge *edge,
     void *state, bool *accept, char *msg
 )
 {
-    LG_RpqPath_JoinContext *context = state ;
-    int info = LG_RpqPath_ActivatePrefix (context, prefix, msg) ;
-    if (info != GrB_SUCCESS) return (info) ;
-    uint64_t key [3] = { edge->destination->vertex, 0, 0 } ;
-    if (context->edges)
+    (void) msg ;
+    LG_RpqPath_Reconstruction *work = state ;
+    uint64_t from = prefix->vertex, to = edge->destination->vertex ;
+    uint64_t hash = work->bloom_edges ? LG_RpqPath_BloomKey (from, edge->label, to) :
+        LG_RpqPath_BloomKey (to, 0, 0) ;
+    for (const LG_RpqPath_Node *node = prefix ; node != NULL ; node = node->prefix)
     {
-        key[0] = prefix->vertex ;
-        key[1] = edge->label ;
-        key[2] = edge->destination->vertex ;
+        if (!LG_RpqPath_BloomMayContain (&work->bloom_shape, LG_RpqPath_NodeStorage (node)->bloom, hash))
+        { *accept = true ; return GrB_SUCCESS ; }
+        bool match = work->bloom_edges ? node->prefix != NULL &&
+            node->prefix->vertex == from && node->label == edge->label && node->vertex == to :
+            node->vertex == to ;
+        if (match) { *accept = false ; return GrB_SUCCESS ; }
+        // The parent's filter describes exactly the remaining ancestor chain.
     }
-    *accept = context->visited.count == 0 ||
-        !context->visited.entries[LG_RpqPath_VisitSlot (&context->visited, key)].used ;
-    return (GrB_SUCCESS) ;
+    *accept = true ; return GrB_SUCCESS ;
 }
 
 static void LG_RpqPath_RelaxDistance
@@ -2217,11 +2186,9 @@ static int LG_RpqPath_ReconstructSimple
     LG_RpqPath_Reconstruction *work, const GrB_Index *QF, size_t nqf, GrB_Index ng, char *msg
 )
 {
-    LG_RpqPath_JoinContext context = { 0 } ;
-    int info = LG_RpqPath_GenerateTargets (work, QF, nqf, ng,
-        LG_RpqPath_JoinRestricted, &context, msg) ;
-    LAGraph_Free ((void **) &context.visited.entries, NULL) ;
-    return (info) ;
+    int info = LG_RpqPath_PathBloomInit (work, false) ;
+    if (info != GrB_SUCCESS) return info ;
+    return LG_RpqPath_GenerateTargets (work, QF, nqf, ng, LG_RpqPath_JoinRestricted, work, msg) ;
 }
 
 static int LG_RpqPath_ReconstructTrails
@@ -2229,11 +2196,9 @@ static int LG_RpqPath_ReconstructTrails
     LG_RpqPath_Reconstruction *work, const GrB_Index *QF, size_t nqf, GrB_Index ng, char *msg
 )
 {
-    LG_RpqPath_JoinContext context = { .edges = true } ;
-    int info = LG_RpqPath_GenerateTargets (work, QF, nqf, ng,
-        LG_RpqPath_JoinRestricted, &context, msg) ;
-    LAGraph_Free ((void **) &context.visited.entries, NULL) ;
-    return (info) ;
+    int info = LG_RpqPath_PathBloomInit (work, true) ;
+    if (info != GrB_SUCCESS) return info ;
+    return LG_RpqPath_GenerateTargets (work, QF, nqf, ng, LG_RpqPath_JoinRestricted, work, msg) ;
 }
 
 typedef int (*LG_RpqPath_ReconstructFn)
@@ -2329,6 +2294,7 @@ static int LG_RpqPath_Process
         reconstruction.paths = *paths ;
         *paths = NULL ;
     }
+    LG_RpqPath_BloomNodesFree (&reconstruction.bloom_nodes) ;
     LG_RpqPath_FreePaths (&reconstruction.paths, reconstruction.count) ;
     return (info) ;
 }
@@ -2382,7 +2348,8 @@ static int LG_RpqPath_Query
     LG_RpqPath_StoredOwner P_owner =
     {
         .allocations = ATOMIC_VAR_INIT (NULL),
-        .error = ATOMIC_VAR_INIT (GrB_SUCCESS)
+        .error = ATOMIC_VAR_INIT (GrB_SUCCESS),
+        .bloom_lock = ATOMIC_FLAG_INIT
     } ;
     int info = LG_RpqPath_Init (&work, R, nl, G, msg) ;
     if (info != GrB_SUCCESS) goto query_cleanup ;
