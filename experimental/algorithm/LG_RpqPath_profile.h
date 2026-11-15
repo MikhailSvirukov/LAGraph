@@ -1,5 +1,5 @@
 // Private instrumentation for LAGraph_2RpqPath.c. No GraphBLAS callback does I/O.
-// Enabled by LG_RPQ_PROFILE=/path/prefix; one exclusive file per query.
+// Caller-owned stream, explicitly configured by SetProfile; all calls share one TSV.
 #ifndef LG_RPQ_PATH_PROFILE_H
 #define LG_RPQ_PATH_PROFILE_H
 #include <stdio.h>
@@ -26,6 +26,7 @@ static const char *LG_RpqPath_CounterNames[] = { LG_RPQ_COUNTERS (LG_RPQ_NAME) }
 typedef struct
 {
     FILE *file ;
+    uint64_t pid, call ;
     char *buffer ;
     size_t used, capacity, iteration ;
     int64_t label ;
@@ -70,8 +71,8 @@ static void LG_RpqPath_ProfileText (LG_RpqPath_Profile *p, const char *key, cons
         clean[k] = value[k] == '\t' || value[k] == '\n' || value[k] == '\r' ? ' ' : value[k] ;
     clean[k] = '\0' ;
     char row[1024] ;
-    int n = snprintf (row, sizeof (row), "%s\t%zu\t%" PRId64 "\t%s\t%.6f\t%s\t%s\n",
-        p->phase, p->iteration, p->label, p->event, p->stamp, key, clean) ;
+    int n = snprintf (row, sizeof (row), "%" PRIu64 "\t%" PRIu64 "\t%s\t%zu\t%" PRId64 "\t%s\t%.6f\t%s\t%s\n",
+        p->pid, p->call, p->phase, p->iteration, p->label, p->event, p->stamp, key, clean) ;
     if (n < 0 || (size_t) n >= sizeof (row) || p->used > SIZE_MAX - (size_t) n)
     { p->failed = true ; return ; }
     size_t needed = p->used + (size_t) n ;
@@ -106,41 +107,54 @@ static void LG_RpqPath_ProfileFlush (LG_RpqPath_Profile *p)
     p->used = 0 ;
     p->io_ms += 1000 * (LAGraph_WallClockTime () - start) ;
 }
+// Configuration is thread-local; a stream must not be shared concurrently.
+static _Thread_local FILE *LG_RpqPath_ProfileStream = NULL ;
+static _Thread_local const char *LG_RpqPath_ProfileQuery = NULL ;
+static _Thread_local size_t LG_RpqPath_ProfilePass = 0 ;
+static _Thread_local bool LG_RpqPath_ProfileWarmup = false ;
+int LAGraph_2RpqPath_SetProfile (FILE *stream, const char *query,
+    size_t pass, bool warmup, char *msg)
+{
+    LG_RpqPath_ProfileStream = NULL ;
+    if (stream != NULL)
+    {
+        if (ftell (stream) == 0 && fprintf (stream,
+            "pid\tcall\tphase\titeration\tlabel\tevent\telapsed_ms\tmetric\tvalue\n") < 0)
+            return GrB_INVALID_VALUE ;
+        if (fflush (stream) != 0) return GrB_INVALID_VALUE ;
+    }
+    LG_RpqPath_ProfileStream = stream ; LG_RpqPath_ProfileQuery = query ;
+    LG_RpqPath_ProfilePass = pass ; LG_RpqPath_ProfileWarmup = warmup ;
+    if (msg != NULL) msg[0] = '\0' ;
+    return GrB_SUCCESS ;
+}
 static LG_RpqPath_Profile *LG_RpqPath_ProfileOpen (LG_RpqPath_Profile *p)
 {
-    const char *prefix = getenv ("LG_RPQ_PROFILE") ;
-    if (prefix == NULL || *prefix == '\0') return NULL ;
+    if (LG_RpqPath_ProfileStream == NULL) return NULL ;
     static atomic_uint_fast64_t serial = ATOMIC_VAR_INIT (0) ;
     uint64_t id = atomic_fetch_add (&serial, 1) ;
-    size_t size = strlen (prefix) + 100 ;
-    char *name = malloc (size) ;
-    if (name == NULL) return NULL ;
-    snprintf (name, size, "%s.%ld.%" PRIu64 ".tsv", prefix, (long) getpid (), id) ;
-    FILE *file = fopen (name, "wx") ;
-    if (file == NULL) fprintf (stderr, "RPQ profile: cannot create %s\n", name) ;
-    free (name) ;
-    if (file == NULL) return NULL ;
-    *p = (LG_RpqPath_Profile) { .file = file, .label = -1,
+    *p = (LG_RpqPath_Profile) { .file = LG_RpqPath_ProfileStream,
+        .pid = (uint64_t) getpid (), .call = id, .label = -1,
         .phase = "query", .event = "begin", .first_answer_ms = -1 } ;
     for (int k = 0 ; k < LG_RPQ_COUNTER_COUNT ; k++) atomic_init (&p->counters[k], 0) ;
     p->start = LAGraph_WallClockTime () ; p->next_sample = p->start + 0.1 ;
-    if (fprintf (file, "phase\titeration\tlabel\tevent\telapsed_ms\tmetric\tvalue\n") < 0)
-        p->failed = true ;
-    LG_RpqPath_ProfileU (p, "schema", 1) ;
-    LG_RpqPath_ProfileU (p, "pid", (uint64_t) getpid ()) ;
-    LG_RpqPath_ProfileU (p, "call", id) ;
-    const char *run = getenv ("LG_RPQ_PROFILE_RUN_ID") ;
-    LG_RpqPath_ProfileText (p, "run_id", run == NULL ? "" : run) ;
+    LG_RpqPath_ProfileU (p, "schema", 2) ;
+    LG_RpqPath_ProfileU (p, "pid", p->pid) ; LG_RpqPath_ProfileU (p, "call", id) ;
+    LG_RpqPath_ProfileText (p, "query", LG_RpqPath_ProfileQuery == NULL ? "" : LG_RpqPath_ProfileQuery) ;
+    LG_RpqPath_ProfileU (p, "pass", LG_RpqPath_ProfilePass) ;
+    LG_RpqPath_ProfileU (p, "warmup", LG_RpqPath_ProfileWarmup) ;
     LG_RpqPath_ProfileText (p, "matrix_method", "AUTO") ;
+    LG_RpqPath_ProfileFlush (p) ; // retain call identity even on an early crash
     return p ;
 }
-static void LG_RpqPath_ProfileClose (LG_RpqPath_Profile *p)
+static int LG_RpqPath_ProfileClose (LG_RpqPath_Profile *p)
 {
-    if (p == NULL) return ;
+    if (p == NULL) return GrB_SUCCESS ;
     LG_RpqPath_ProfileFlush (p) ;
-    if (fclose (p->file) != 0) p->failed = true ;
-    if (p->failed) fprintf (stderr, "RPQ profile: incomplete log (I/O or allocation failure)\n") ;
+    bool failed = p->failed ;
+    if (failed) fprintf (stderr, "RPQ profile: incomplete log (I/O or allocation failure)\n") ;
     free (p->buffer) ;
+    return failed ? GrB_INVALID_VALUE : GrB_SUCCESS ;
 }
 // Call time and completion time are disjoint. Waiting is profiling-only.
 static int LG_RpqPath_ProfileOperation (LG_RpqPath_Profile *p,

@@ -19,6 +19,21 @@ class AggregationTest(unittest.TestCase):
                                     check=True, text=True, capture_output=True)
             return list(csv.DictReader(io.StringIO(result.stdout), delimiter='\t')), result.stderr
 
+    def test_multiple_calls_in_shared_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'profile-results.tsv'
+            path.write_text('pid\tcall\tphase\titeration\tlabel\tevent\telapsed_ms\tmetric\tvalue\n'
+                            '7\t0\tquery\t0\t-1\tbegin\t0\tcall\t0\n'
+                            '7\t0\tquery\t0\t-1\tend\t1\tstatus\t0\n'
+                            '7\t0\tquery\t0\t-1\tend\t1\tpaths\t3\n'
+                            '7\t1\tquery\t0\t-1\tbegin\t0\tcall\t1\n')
+            result = subprocess.run([sys.executable, str(SCRIPT), str(path)],
+                                    check=True, text=True, capture_output=True)
+            rows = list(csv.DictReader(io.StringIO(result.stdout), delimiter='\t'))
+            self.assertEqual([row['complete'] for row in rows], ['1', '0'])
+            self.assertEqual(rows[0]['query.end.paths.last'], '3')
+            self.assertEqual(rows[1]['call'], '1')
+
     def test_empty_crash_file(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'empty.tsv'

@@ -2824,7 +2824,12 @@ query_cleanup:
         LG_RpqPath_ProfileD (profile, "io_ms", profile->io_ms) ;
         LG_RpqPath_ProfileD (profile, "status", info) ;
         LG_RpqPath_ProfileU (profile, "paths", *path_count) ;
-        LG_RpqPath_ProfileClose (profile) ;
+        int profile_info = LG_RpqPath_ProfileClose (profile) ;
+        if (info == GrB_SUCCESS && profile_info != GrB_SUCCESS)
+        {
+            LG_RpqPath_FreePaths (paths, *path_count) ; *path_count = 0 ;
+            info = profile_info ;
+        }
     }
     if (info != GrB_SUCCESS && (msg == NULL || msg[0] == '\0'))
     {

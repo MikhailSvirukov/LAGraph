@@ -862,6 +862,16 @@ int LAGraph_2RegularPathQuery   // nodes reachable from the starting by the
 // Inputs must satisfy the documented preconditions; these functions perform
 // no input verification. The standalone benchmark supports Python --verify.
 
+/** Configure profiling for subsequent RPQ calls on this thread (profiling branches).
+ * The caller owns stream and keeps query alive until the next public query ends.
+ * Pass NULL stream to disable; this function never closes the stream.
+ * Use a writable, seekable file and one thread per stream. An empty stream receives
+ * the TSV header immediately. I/O failure returns GrB_INVALID_VALUE.
+ */
+LAGRAPHX_PUBLIC
+int LAGraph_2RpqPath_SetProfile (FILE *stream, const char *query,
+    size_t pass, bool warmup, char *msg) ;
+
 /** Immutable path node.  prefix points to the preceding graph path; label
  * identifies its edge to vertex.  A root has prefix=NULL and length=0; its
  * label is unused.  Nodes may be shared by paths in the same result array.
