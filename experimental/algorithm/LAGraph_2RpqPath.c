@@ -1600,7 +1600,7 @@ int LG_RpqPath_Traverse
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
             info = atomic_load (&stored_owner.error) ;
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
-    
+
             LG_RpqPath_ProfileStored (profile, &stored_owner, previous_allocations) ;
             // 5. All persistent blocks stay query-owned for shared old chains.
             // The P wait allows this iteration's temporary C pool to be reset.

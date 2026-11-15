@@ -169,6 +169,9 @@ static int LG_RpqPath_ProfileOperation (LG_RpqPath_Profile *p,
     LG_RpqPath_ProfileD (p, "wait_ms", 1000 * (ready - end)) ;
     LG_RpqPath_ProfileD (p, "total_ms", 1000 * (ready - start)) ;
     LG_RpqPath_ProfileD (p, "status", info) ;
+    int32_t jit = 0 ;
+    if (GxB_Global_Option_get_INT32 (GxB_JIT_C_CONTROL, &jit) == GrB_SUCCESS)
+        LG_RpqPath_ProfileU (p, "jit_after", jit) ;
     return info ;
 }
 #define LG_RPQ_CALL(name, matrix, call, cleanup) do { \
