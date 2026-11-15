@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate LG_RPQ_PROFILE TSV files; standard library only, no plots."""
+"""Aggregate RPQ profile-results.tsv files; standard library only, no plots."""
 import argparse
 import csv
 import glob
@@ -16,7 +16,7 @@ def read(path):
             print(f'{path}: empty profile (interrupted before header flush)', file=sys.stderr)
             return
         required = {'phase', 'iteration', 'label', 'event', 'elapsed_ms', 'metric', 'value'}
-        if set(reader.fieldnames or []) != required:
+        if set(reader.fieldnames or []) not in (required, required | {'pid', 'call'}):
             raise ValueError(f'{path}: unexpected profile header')
         for row in reader:
             if None in row or any(row[k] is None for k in required):
@@ -36,11 +36,20 @@ def main():
     if not paths:
         parser.error('no input files matched')
     output = []
-    for path in paths:
+    from itertools import groupby
+    def batches():
+        for path in paths:
+            seen = False
+            for _, records in groupby(read(path), key=lambda row: (row.get('pid', ''), row.get('call', ''))):
+                seen = True
+                yield path, records
+            if not seen:
+                yield path, ()
+    for path, records in batches():
         groups = defaultdict(dict)
         metadata = {'file': str(Path(path))}
         complete = False
-        for row in read(path):
+        for row in records:
             phase, event, metric = row['phase'], row['event'], row['metric']
             if phase == 'query' and event == 'begin':
                 metadata[metric] = row['value']
@@ -82,7 +91,7 @@ def main():
             output.append(result)
     # Compact query view: sums of per-iteration work and final cumulative state.
     compact = [
-        'file', 'run_id', 'pid', 'call', 'semantics', 'complete',
+        'file', 'query', 'pass', 'warmup', 'pid', 'call', 'semantics', 'complete',
         'query.end.status.last', 'query.end.paths.last', 'query.end.total_ms.last',
         'query.end.snapshot_ms.last', 'query.end.io_ms.last',
         'traverse.end.iterations.last', 'traverse.end.total_ms.last',

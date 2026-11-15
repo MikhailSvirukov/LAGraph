@@ -6,35 +6,30 @@
 
 ## Запуск
 
-Собрать LAGraph обычным способом. При запуске приложения, использующего эту
-сборку, задать префикс файлов (каталог должен существовать):
+В профилирующих ветках бенчмарка профиль автоматически создаётся при --output:
+`<output>/profile-results.tsv`. Переменные LG_RPQ_PROFILE и LG_RPQ_PROFILE_RUN_ID
+больше не используются. Все вызовы, включая разогревы, пишутся в один файл.
+Бенчмарк открывает его заново с режимом w при новом запуске, как results.tsv.
+Ошибка открытия/записи завершает запуск с ненулевым статусом.
 
-```sh
-mkdir -p /tmp/rpq-profile
-LG_RPQ_PROFILE=/tmp/rpq-profile/run LG_RPQ_PROFILE_RUN_ID=experiment-1 ./your-benchmark
-```
-
-Каждый вызов публичного RPQ API создаёт отдельный файл
-`run.<pid>.<call>.tsv` в исключительном режиме, без перезаписи существующего файла.
-При повторном запуске используйте новый префикс/каталог. `RUN_ID` — необязательная
-метка запуска; номер конкретного запроса алгоритму не передаётся. Для сопоставления
-используйте PID и порядок вызовов, учитывая разогревы и повторения бенчмарка.
-
-Без `LG_RPQ_PROFILE` дополнительные ожидания и обходы матриц отключены.
-Ошибки открытия/записи профиля сообщаются в stderr и не меняют результат RPQ.
-Файлы одного процесса не перемешиваются даже при параллельных вызовах.
+C-драйвер принимает явные аргументы `--profile /path/profile-results.tsv` перед
+семантикой. Python формирует их автоматически при --output. Без --output профиль
+не создаётся. Для использования API отдельно вызывающий код открывает FILE*,
+передаёт его в LAGraph_2RpqPath_SetProfile вместе с query/pass/warmup перед запросом
+и закрывает после отключения профиля передачей NULL. Поток принадлежит вызывающему
+коду; профилирование его не закрывает. Разные потоки не должны писать в один FILE*.
 
 ## Агрегация без графиков
 
 Скрипт требует только Python 3 и стандартную библиотеку:
 
 ```sh
-python3 experimental/benchmark/rpq_profile.py '/tmp/rpq-profile/*.tsv' > queries.tsv
-python3 experimental/benchmark/rpq_profile.py '/tmp/rpq-profile/*.tsv' --by iteration > iterations.tsv
-python3 experimental/benchmark/rpq_profile.py '/tmp/rpq-profile/*.tsv' --by label > labels.tsv
-python3 experimental/benchmark/rpq_profile.py '/tmp/rpq-profile/*.tsv' --by sample > samples.tsv
-python3 experimental/benchmark/rpq_profile.py '/tmp/rpq-profile/*.tsv' --all > all.tsv
-python3 experimental/benchmark/rpq_profile.py '/tmp/rpq-profile/*.tsv' --columns 'file,run_id,query.end.*,traverse.mxm*.total_ms.sum,reconstruct.final.*.last' > selected.tsv
+python3 experimental/benchmark/rpq_profile.py 'results/trails/profile-results.tsv' > queries.tsv
+python3 experimental/benchmark/rpq_profile.py 'results/trails/profile-results.tsv' --by iteration > iterations.tsv
+python3 experimental/benchmark/rpq_profile.py 'results/trails/profile-results.tsv' --by label > labels.tsv
+python3 experimental/benchmark/rpq_profile.py 'results/trails/profile-results.tsv' --by sample > samples.tsv
+python3 experimental/benchmark/rpq_profile.py 'results/trails/profile-results.tsv' --all > all.tsv
+python3 experimental/benchmark/rpq_profile.py 'results/trails/profile-results.tsv' --columns 'file,run_id,query.end.*,traverse.mxm*.total_ms.sum,reconstruct.final.*.last' > selected.tsv
 ```
 
 По умолчанию одна строка на вызов с основными временами, ростом структур,
@@ -53,7 +48,9 @@ python3 experimental/benchmark/rpq_profile.py '/tmp/rpq-profile/*.tsv' --columns
 
 ## Формат и точки измерений
 
-TSV: `phase iteration label event elapsed_ms metric value`. Единицы времени —
+TSV schema 2: `pid call phase iteration label event elapsed_ms metric value`.
+Пара (pid,call) разделяет вызовы внутри общего файла. query/pass/warmup записаны
+в query.begin; номер pass начинается с 1. Скрипт поддерживает и старые файлы schema 1. Единицы времени —
 миллисекунды, памяти — байты; количества — целые числа. `label=-1` означает
 операцию вне цикла меток, `iteration=0` на первом этапе — подготовку.
 `elapsed_ms` — время контрольной точки от начала вызова. Числовые значения
