@@ -1350,12 +1350,11 @@ int LG_RpqPath_Traverse
             if (info != GrB_SUCCESS) goto iteration_cleanup ;
         }
 
-        // 3. Compute the new frontier against OLD P without a mask.  P-only
-        // cells and unchanged candidates produce false; remove those entries
-        // before this matrix is used by the next iteration's products.
-        info = GxB_Matrix_eWiseUnion (next_frontier, NULL, NULL,
+        // 3. Compare candidates against OLD P only at positions present in C.
+        // Unchanged candidates produce false; select removes those entries.
+        info = GxB_Matrix_eWiseUnion (next_frontier, C, NULL,
             ops.has_new_predecessors, C, ops.empty_temporary, P, ops.empty_stored,
-            GrB_DESC_R) ;
+            GrB_DESC_RS) ;
         if (info != GrB_SUCCESS) goto iteration_cleanup ;
         info = GrB_Matrix_select_BOOL (next_frontier, NULL, NULL,
             GrB_VALUEEQ_BOOL, next_frontier, true, GrB_DESC_R) ;
@@ -1367,18 +1366,21 @@ int LG_RpqPath_Traverse
 
         // 4. Extend P with one delta block per changed cell.  P-only cells
         // reuse their old handles; eWiseUnion also converts C-only values.
-        updating_P = true ;
-        info = GxB_Matrix_eWiseUnion (P, NULL, NULL, stored_merge,
-            C, ops.empty_temporary, P, ops.empty_stored, NULL) ;
-        if (info != GrB_SUCCESS) goto iteration_cleanup ;
-        info = GrB_Matrix_wait (P, GrB_MATERIALIZE) ;
-        if (info != GrB_SUCCESS) goto iteration_cleanup ;
-        info = atomic_load (&stored_owner.error) ;
-        if (info != GrB_SUCCESS) goto iteration_cleanup ;
+        if (frontier_nvals != 0)
+        {
+            updating_P = true ;
+            info = GxB_Matrix_eWiseUnion (P, next_frontier, NULL, stored_merge,
+                C, ops.empty_temporary, P, ops.empty_stored, GrB_DESC_S) ;
+            if (info != GrB_SUCCESS) goto iteration_cleanup ;
+            info = GrB_Matrix_wait (P, GrB_MATERIALIZE) ;
+            if (info != GrB_SUCCESS) goto iteration_cleanup ;
+            info = atomic_load (&stored_owner.error) ;
+            if (info != GrB_SUCCESS) goto iteration_cleanup ;
 
-        // 5. All persistent blocks stay query-owned for shared old chains.
-        // The P wait allows this iteration's temporary C pool to be reset.
-        updating_P = false ;
+            // 5. All persistent blocks stay query-owned for shared old chains.
+            // The P wait allows this iteration's temporary C pool to be reset.
+            updating_P = false ;
+        }
 
         // Transfer the frontier; cleanup must not free the next input.
         GrB_free (&frontier) ;
