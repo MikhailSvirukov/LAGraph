@@ -46,10 +46,10 @@
 #error "LG_RPQ_PATH_MAX_COUNT must be positive"
 #endif
 
-// Number of predecessor records in one temporary block.  This is a baseline
-// layout constant, not a tuned value; changing it requires user approval.
+// Small temporary sets dominate RPQ workloads. Keep blocks compact while
+// retaining chained storage for larger sets; builds may override this value.
 #ifndef LG_RPQ_PATH_BLOCK_CAPACITY
-#define LG_RPQ_PATH_BLOCK_CAPACITY 64
+#define LG_RPQ_PATH_BLOCK_CAPACITY 4
 #endif
 #if LG_RPQ_PATH_BLOCK_CAPACITY < 1
 #error "LG_RPQ_PATH_BLOCK_CAPACITY must be positive"
