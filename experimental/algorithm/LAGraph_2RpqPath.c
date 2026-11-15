@@ -197,7 +197,7 @@ LG_RpqPath_PredecessorBlock ;
 // Blocks are allocated lazily by callbacks and registered with an atomic list
 // push.  No block is removed until all readers finish at the end of the step.
 // The error flag carries malloc failures out of callbacks with void returns.
-typedef struct
+typedef struct LG_RpqPath_BlockPool
 {
     _Atomic (LG_RpqPath_PredecessorBlock *) allocations ;
     atomic_int error ;
@@ -539,7 +539,7 @@ LG_RpqPath_StoredSet ;
 // Callbacks may allocate concurrently.  They only prepend to this owner list;
 // nothing is removed or freed until all callbacks have completed.  This is
 // independent of the unchanged fixed-block pool used by temporary C values.
-typedef struct
+typedef struct LG_RpqPath_StoredOwner
 {
     _Atomic (LG_RpqPath_StoredAllocation *) allocations ;
     atomic_int error ;
@@ -722,6 +722,34 @@ static void LG_RpqPath_ProfileCounters (LG_RpqPath_Profile *p, bool reset)
 }
 
 
+// JIT kernels copy these handles by value; pointees remain owned by the query.
+// Opaque forward declarations suffice because these kernels never dereference
+// the allocator or block pointers. Guards allow multiple UDTs in one kernel.
+#define LG_RPQ_TEMPORARY_TYPE_DEFN \
+    "#include <stddef.h>\n" \
+    "#ifndef LG_RPQ_TEMPORARY_TYPE_DEFINED\n" \
+    "#define LG_RPQ_TEMPORARY_TYPE_DEFINED\n" \
+    "typedef struct { struct LG_RpqPath_BlockPool *pool; " \
+    "struct LG_RpqPath_PredecessorBlock *head; } LG_RpqPath_TemporarySet;\n" \
+    "#endif\n"
+#define LG_RPQ_STORED_TYPE_DEFN \
+    "#include <stddef.h>\n#include <stdint.h>\n" \
+    "#ifndef LG_RPQ_STORED_TYPE_DEFINED\n" \
+    "#define LG_RPQ_STORED_TYPE_DEFINED\n" \
+    "typedef struct { size_t count; " \
+    "struct LG_RpqPath_StoredAllocation *allocation; uint64_t bloom[2]; " \
+    "} LG_RpqPath_StoredSet;\n#endif\n"
+#define LG_RPQ_PREDECESSOR_CONTEXT_DEFN \
+    "#include <stddef.h>\n" \
+    "#ifndef LG_RPQ_PREDECESSOR_CONTEXT_DEFINED\n" \
+    "#define LG_RPQ_PREDECESSOR_CONTEXT_DEFINED\n" \
+    "typedef struct { struct LG_RpqPath_BlockPool *pool; size_t label; " \
+    "} LG_RpqPath_PredecessorContext;\n#endif\n"
+#define LG_RPQ_STORED_CONTEXT_DEFN \
+    "#ifndef LG_RPQ_STORED_CONTEXT_DEFINED\n" \
+    "#define LG_RPQ_STORED_CONTEXT_DEFINED\n" \
+    "typedef struct { struct LG_RpqPath_StoredOwner *owner; " \
+    "} LG_RpqPath_StoredContext;\n#endif\n"
 
 /**
  * @brief Allocate one immutable delta block and register its query owner.
@@ -1147,11 +1175,28 @@ int LG_RpqPath_Init
         GrB_OUT_OF_MEMORY, "state set size exceeds addressable memory") ;
     size_t state_set_size = sizeof (LG_RpqPath_StateSet) +
         (size_t) work->nr * sizeof (GrB_Index) ;
-    GRB_TRY (GrB_Type_new (&work->state_set_type, state_set_size)) ;
-    GRB_TRY (GrB_Type_new (&work->temporary_set_type,
-        sizeof (LG_RpqPath_TemporarySet))) ;
-    GRB_TRY (GrB_Type_new (&work->stored_set_type,
-        sizeof (LG_RpqPath_StoredSet))) ;
+    // A flexible array alone would give sizeof(header) in a JIT kernel.
+    // Give each query size a concrete array and a distinct C type name instead.
+    char state_name [128], state_defn [512] ;
+    snprintf (state_name, sizeof (state_name), "LG_RpqPath_StateSet_%zu",
+        (size_t) work->nr) ;
+    if (work->nr != 0)
+        snprintf (state_defn, sizeof (state_defn),
+            "#include <stddef.h>\n#include <stdint.h>\n"
+            "typedef struct { size_t count; size_t capacity; uint64_t states[%zu]; } %s;\n",
+            (size_t) work->nr, state_name) ;
+    else
+        snprintf (state_defn, sizeof (state_defn),
+            "#include <stddef.h>\n"
+            "typedef struct { size_t count; size_t capacity; } %s;\n", state_name) ;
+    GRB_TRY (GxB_Type_new (&work->state_set_type, state_set_size,
+        state_name, state_defn)) ;
+    GRB_TRY (GxB_Type_new (&work->temporary_set_type,
+        sizeof (LG_RpqPath_TemporarySet), "LG_RpqPath_TemporarySet",
+        LG_RPQ_TEMPORARY_TYPE_DEFN)) ;
+    GRB_TRY (GxB_Type_new (&work->stored_set_type,
+        sizeof (LG_RpqPath_StoredSet), "LG_RpqPath_StoredSet",
+        LG_RPQ_STORED_TYPE_DEFN)) ;
 
     *workspace = work ;
     return (GrB_SUCCESS) ;
@@ -1312,8 +1357,9 @@ static int LG_RpqPath_CreatePredecessorOperators
     info = GrB_Monoid_new_UDT (&ops->predecessor_union_monoid,
         ops->predecessor_union, &empty_predecessor_set) ;
     if (info != GrB_SUCCESS) return (info) ;
-    info = GrB_Type_new (&ops->predecessor_context_type,
-        sizeof (LG_RpqPath_PredecessorContext)) ;
+    info = GxB_Type_new (&ops->predecessor_context_type,
+        sizeof (LG_RpqPath_PredecessorContext), "LG_RpqPath_PredecessorContext",
+        LG_RPQ_PREDECESSOR_CONTEXT_DEFN) ;
     if (info != GrB_SUCCESS) return (info) ;
     info = GxB_IndexBinaryOp_new (&ops->collect_predecessors,
         LG_RpqPath_CollectPredecessors, work->temporary_set_type,
@@ -1352,8 +1398,9 @@ static int LG_RpqPath_CreateAccumulationOperators
         LG_RpqPath_HasNewPredecessors, GrB_BOOL,
         work->temporary_set_type, work->stored_set_type) ;
     if (info != GrB_SUCCESS) return (info) ;
-    info = GrB_Type_new (&ops->stored_context_type,
-        sizeof (LG_RpqPath_StoredContext)) ;
+    info = GxB_Type_new (&ops->stored_context_type,
+        sizeof (LG_RpqPath_StoredContext), "LG_RpqPath_StoredContext",
+        LG_RPQ_STORED_CONTEXT_DEFN) ;
     if (info != GrB_SUCCESS) return (info) ;
     info = GxB_IndexBinaryOp_new (&ops->merge_predecessors,
         LG_RpqPath_MergePredecessors, work->stored_set_type,
