@@ -1,9 +1,9 @@
 # Типы RPQ для JIT
 
-Ветка `svmk17/rpq-paths-auto-optimized-jit-types-profiling` содержит
+Ветка `svmk17/rpq-latest-profile` содержит
 оптимизированный алгоритм, определения типов для JIT и профилирование из
 `svmk17/rpq-paths-profiling`. Оба умножения сохраняют режим AUTO.
-Версия без профилирования: `svmk17/rpq-paths-auto-optimized-jit-types`.
+Версия без профилирования: `svmk17/rpq-latest`.
 
 H, C, P и два контекстных скаляра регистрируются через `GxB_Type_new` с C-именем
 и определением. В H гибкий массив заменён в JIT-определении конкретным массивом
